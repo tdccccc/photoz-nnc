@@ -1,0 +1,124 @@
+# KNN Photometric Redshift Configuration
+
+# Basic settings
+save_dir: "./exp"
+experiment_name: "0test"
+random_seed: 2025
+
+# Evaluation optimization
+train_subsample: 2000000       # Subsample training set to 1M (set to null to disable)
+validation_subsample: 50000    # Subsample validation set to 50k (set to null to disable)
+test_batch_size: 100000        # Evaluate test set in batches of 100k to reduce memory
+
+# KNN Model parameters
+knn_params:
+  k_neighbors: 30              # Number of nearest neighbors
+  metric: "weighted"         # 'euclidean', 'weighted', or 'chi_square' (recommended)
+  algorithm: "auto"            # 'auto', 'ball_tree', 'kd_tree', 'brute'
+  leaf_size: 20               # Leaf size for tree algorithms
+  n_jobs: -1                  # Use all CPU cores
+  use_faiss: true            # Use FAISS for faster search (only for euclidean/weighted, not chi_square)
+
+# Dataset configuration
+dataset_params:
+  # Feature scaling
+  use_scaler: false            # Whether to use StandardScaler on features (recommended: false for chi_square metric)
+
+  # Color features (must be provided)
+  color_feature_columns: [
+    'Kron_gr', 'Kron_ri', 'Kron_iz', 'Kron_zy',
+    'Ap_gr', 'Ap_ri', 'Ap_iz', 'Ap_zy'
+  ]
+
+  # Color errors (required for 'weighted' and 'chi_square' metrics)
+  error_feature_columns: [
+    'Kron_gr_Err', 'Kron_ri_Err', 'Kron_iz_Err', 'Kron_zy_Err',
+    'Ap_gr_Err', 'Ap_ri_Err', 'Ap_iz_Err', 'Ap_zy_Err'
+  ]
+
+  # Error weighting parameters
+  weight_by_errors: true       # Weight distances by color errors
+  error_floor: 0.01            # Maximum error floor to avoid division by zero (auto-adjusted to min error)
+  normalize_weights: true      # Normalize weights to have mean 1
+
+# Data loading mode
+dataset_mode:
+  type: "files"               # 'files' or 'ratio'
+
+  # For 'files' mode - specify separate train/val/test files
+  paths:
+    train: "/home/tiandc/panstarrs/panstarrs_desi/data/DESIDR1_xSDSSDR19_xps1dr2phot_clean_train.fits"
+    val: "/home/tiandc/panstarrs/panstarrs_desi/data/DESIDR1_xSDSSDR19_xps1dr2phot_clean_val.fits"
+    test: "/home/tiandc/panstarrs/panstarrs_desi/data/DESIDR1_xSDSSDR19_xps1dr2phot_clean_test.fits"
+
+  # For 'ratio' mode - split single file
+  # file_path: "/path/to/full_data.fits"
+  # ratios:
+  #   train: 0.8
+  #   val: 0.1
+  #   test: 0.1
+
+
+# Notes:
+# -------
+# 1. Memory Optimization:
+#    - train_subsample: Limits training set size (e.g., 1000000 for 1M samples)
+#      * Reduces memory usage during model fitting
+#      * Randomly samples from full training set
+#      * Set to null to use full training set
+#    - validation_subsample: Limits validation set size for faster evaluation
+#    - test_batch_size: Processes test set in batches to reduce memory usage
+#
+# 2. use_faiss:
+#    - Enables FAISS library for faster nearest neighbor search
+#    - ONLY works with 'euclidean' or 'weighted' metrics
+#    - NOT compatible with 'chi_square' metric (chi_square uses custom distance)
+#    - Requires installation: pip install faiss-cpu (or faiss-gpu for GPU support)
+#    - Significantly faster for large datasets (>100k samples)
+#    - Reduces memory usage during search
+#
+# 3. use_scaler:
+#    - Controls whether to apply StandardScaler to features
+#    - For chi_square metric: RECOMMENDED to set use_scaler=false
+#      * Chi-square distance already normalizes by errors: (color1-color2)^2 / (err1^2 + err2^2)
+#      * Additional scaling may distort the color/error relationship
+#    - For euclidean/weighted metrics: RECOMMENDED to set use_scaler=true
+#      * Prevents features with different scales from dominating distance
+#    - Default: true (for backward compatibility)
+#
+# 4. metric='chi_square' (RECOMMENDED for accuracy):
+#    - Uses chi-square distance: sum[(color1-color2)^2 / (err1^2 + err2^2)]
+#    - Considers BOTH training and query sample errors
+#    - Most accurate for photo-z with error information
+#    - Requires both color_feature_columns and error_feature_columns
+#    - NOT compatible with use_faiss (uses custom batched distance computation)
+#
+# 5. metric='weighted' (RECOMMENDED for speed with errors):
+#    - Uses single-sided error weighting
+#    - Each sample is weighted by 1/error before computing euclidean distance
+#    - Less accurate than chi_square but faster
+#    - Compatible with use_faiss for even better performance
+#
+# 6. metric='euclidean' (fastest, no error info):
+#    - Standard euclidean distance, no error weighting
+#    - Fastest but ignores error information
+#    - Compatible with use_faiss
+#
+# 7. error_floor:
+#    - Sets maximum floor value for errors
+#    - Actual floor is min(data_min_error, error_floor)
+#    - Prevents division by zero and over-weighting small errors
+#
+# Recommended configurations:
+# ---------------------------
+# For best accuracy (slow on large datasets):
+#   metric: "chi_square", use_faiss: false, use_scaler: false
+#   train_subsample: null  # Use full training set
+#
+# For balanced accuracy/speed (RECOMMENDED):
+#   metric: "chi_square", use_faiss: false, use_scaler: false
+#   train_subsample: 1000000  # Subsample to 1M
+#
+# For maximum speed (acceptable accuracy):
+#   metric: "weighted", use_faiss: true, use_scaler: true
+#   train_subsample: 500000  # Subsample to 500k
