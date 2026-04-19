@@ -1,0 +1,94 @@
+# Usage:
+#   python -m models.photoz.ANN.train --config path/to/config.yaml
+#
+# Outputs land in {save_dir}/{experiment_name}/:
+#   config.yaml, scaler.pkl, best_model.pkl, checkpoint.pkl,
+#   training.log, metrics_curve.jpg, test_results.txt
+
+# ---------------------------------------------------------------
+# Experiment identity
+# ---------------------------------------------------------------
+experiment_name: "experiment_01"
+random_seed: 2025
+gpu_id: "0"
+save_dir: "./runs"
+
+# ---------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------
+model_class_name: "PhotozRegressor"
+model_params:
+  hidden_dims: [512, 256, 128, 64]
+  dropout_rate: 0.1
+  activation_function: "relu"   # relu | gelu | leaky_relu | elu | silu
+  use_batch_norm: true
+  use_layer_norm: false
+  use_residual: true
+
+# ---------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------
+dataset_class_name: "DatasetPhotozRegression"
+dataset_params:
+  # Feature columns (explicit list recommended).
+  # Example: Legacy Surveys DR10 g/r/i/z + WISE W1/W2.
+  feature_columns: [
+    "dered_mag_g", "dered_mag_r", "dered_mag_i",
+    "dered_mag_z", "dered_mag_w1", "dered_mag_w2",
+    "mag_g_Err", "mag_r_Err", "mag_i_Err",
+    "mag_z_Err", "mag_w1_Err", "mag_w2_Err",
+  ]
+
+  # Label noise — only applied to training split.
+  label_noise:
+    type: "gaussian"             # gaussian | uniform | relative_gaussian | relative_uniform
+    level: 0.0                   # 0.0 = disabled
+
+dataset_mode:
+  type: "files"
+  paths:
+    train: "/path/to/train.fits"
+    val:   "/path/to/val.fits"
+    test:  "/path/to/test.fits"
+  # ratios:
+  #   train: 0.8
+  #   val:   0.1
+  #   test:  0.1
+
+# ---------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------
+batch_size: 4096
+epochs: 300
+early_stopping: 20
+
+optimizer_config:
+  name: "AdamW"
+  params:
+    lr: 0.0005
+    weight_decay: 0.00001
+
+scheduler_config:
+  name: "ReduceLROnPlateau"
+  params:
+    mode: min
+    factor: 0.5
+    patience: 5
+
+gradient_clipping:
+  enabled: true
+  method: "norm"                 # norm | value
+  max_norm: 1.0
+
+# ---------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------
+# type: mse | mae | huber | smooth_l1
+#
+# The model outputs a single scalar redshift, so only standard
+# regression losses are available (contrast with the NNC package,
+# which has KL / CRPS / focal / … for the binned-PDF formulation).
+loss_config:
+  type: "huber"
+  huber_delta: 1.0               # for Huber loss (robust to outliers)
+  # smooth_l1_beta: 1.0          # for Smooth L1 loss
