@@ -1,0 +1,79 @@
+config_path: photoz_bin_config.yaml
+save_dir: ./grzW1W2+PS1DR2i
+experiment_name: All
+random_seed: 2025
+gpu_id: '1'
+model_params:
+  hidden_dims:
+  - 512
+  - 256
+  - 128
+  - 64
+  dropout_rate: 0.1
+  activation_function: relu
+  use_batch_norm: true
+  use_layer_norm: false
+  use_residual: true
+model_class_name: PhotozBinningClassifier
+dataset_params:
+  binning_config:
+    z_min: 0.0
+    z_max: 2
+    num_bins: 400
+    soft_label_width: 0.1
+  feature_columns:
+  - dered_mag_g
+  - dered_mag_r
+  - dered_mag_z
+  - dered_mag_w1
+  - dered_mag_w2
+  - mag_g_Err
+  - mag_r_Err
+  - mag_z_Err
+  - mag_w1_Err
+  - mag_w2_Err
+  - iPSFMag_dered
+  - iKronMag_dered
+  - iApMag_dered
+  - iPSFMagErr
+  - iKronMagErr
+  - iApMagErr
+dataset_class_name: DatasetPhotozBinned
+dataset_mode:
+  type: files
+  paths:
+    train: /home/tiandc/photoz/lsdr9x10/data/LSDR9x10xPS1DR2/DESIDR1_xSDSSDR19_xlsdr9x10Phot_clean_xPS1DR2Photi_train.fits
+    val: /home/tiandc/photoz/lsdr9x10/data/LSDR9x10xPS1DR2/DESIDR1_xSDSSDR19_xlsdr9x10Phot_clean_xPS1DR2Photi_val.fits
+    test: /home/tiandc/photoz/lsdr9x10/data/LSDR9x10xPS1DR2/DESIDR1_xSDSSDR19_xlsdr9x10Phot_clean_xPS1DR2Photi_test.fits
+optimizer_config:
+  name: AdamW
+  params:
+    lr: 0.0005
+    weight_decay: 1.0e-05
+scheduler_config:
+  name: ReduceLROnPlateau
+  params:
+    mode: min
+    factor: 0.5
+    patience: 5
+batch_size: 4096
+epochs: 300
+early_stopping: 20
+gradient_clipping:
+  enabled: true
+  method: norm
+  max_norm: 1.0
+loss_config:
+  type: crps
+sampling_config:
+  balanced_sampling:
+    enabled: false
+    bins: 10
+    z_min: 0.0
+    z_max: 1.2
+pit_config:
+  enabled: true
+  monitor_interval: 10
+  n_bins: 20
+  plot: true
+  plot_interval: 20

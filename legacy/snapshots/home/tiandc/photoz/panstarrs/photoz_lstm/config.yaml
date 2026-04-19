@@ -1,0 +1,93 @@
+# nohup python3 photoz_lstm.py --config config.yaml &
+experiment_name: "0LSTMwithUncertainty_addLayersUnits"
+random_seed: 2025
+gpu_id: '0'
+save_dir: "."
+
+# Model configuration
+model_class_name: 'DeepPhotozLSTMWithUncertainty'  # 'DeepPhotozLSTMWithUncertainty'
+model_params:
+  input_dim: 38
+  lstm_hidden_size: 32
+  num_lstm_layers: 2
+  fc_hidden_dims: [1024, 512, 256]
+  dropout_rate: 0.2
+  use_batch_norm: true
+  output_activation: 'relu'
+
+# Dataset configuration
+dataset_class_name: 'Dataset_Photz'
+dataset_params:
+  # file_path: "/home/tiandc/panstarrs/panstarrs_desi/data/ps1dr2_loc_xDESIDR1_xSDSSDR18_phot_clean_train.fits"
+  mag_types: ['Kron', 'PSF', 'Ap']
+  color_types: ['Kron', 'Ap']
+  use_mag: true
+  use_magerr: true
+  use_colorerr: false
+  label_noise: 0.0
+
+dataset_mode:
+  # type: 'ratio'
+  # ratios:
+  #   train: 0.8
+  #   val: 0.1
+  #   test: 0.1
+  type: 'files'
+  paths:
+    train: "/home/tiandc/panstarrs/panstarrs_desi/data/ps1dr2_loc_xDESIDR1_xSDSSDR18_phot_clean_train.fits"
+    val: "/home/tiandc/panstarrs/panstarrs_desi/data/ps1dr2_loc_xDESIDR1_xSDSSDR18_phot_clean_val.fits"
+    test: "/home/tiandc/panstarrs/panstarrs_desi/data/ps1dr2_loc_xDESIDR1_xSDSSDR18_phot_clean_test.fits"
+
+# label_transform: "none"
+# Label transformation configuration (choose one)
+# Option 1: log1p transformation (recommended for redshift starting from 0)
+# label_transform: "log1p"  # log(1 + z)
+# label_transform_params: {}
+
+# Option 2: log transformation with offset
+# label_transform: "log"
+# label_transform_params:
+#   offset: 1.  # log(z + offset)
+
+# Option 3: square root transformation
+label_transform: "sqrt"
+label_transform_params: {}
+
+# Option 4: power transformation
+# label_transform: "power"
+# label_transform_params:
+#   power: 0.5  # z^0.5
+
+# Option 5: asinh transformation (handles negative values)
+# label_transform: "asinh"
+# label_transform_params:
+#   scale: 1.0
+
+# Training configuration
+batch_size: 4096
+epochs: 300
+early_stopping: 20
+loss_type: "gaussian_nll"  # "gaussian_nll","mse","huber"
+train_augmentation: false
+
+# Optimizer configuration
+optimizer_config:
+  name: "AdamW"
+  params:
+    lr: 0.0005
+    weight_decay: 0.001
+
+# Scheduler configuration
+scheduler_config:
+  name: "ReduceLROnPlateau"
+  params:
+    mode: min
+    factor: 0.5
+    patience: 5
+    verbose: true
+
+# Gradient clipping
+gradient_clipping:
+  enabled: true
+  method: 'norm'
+  max_norm: 1.0
