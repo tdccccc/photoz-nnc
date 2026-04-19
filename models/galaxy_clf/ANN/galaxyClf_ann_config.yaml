@@ -1,38 +1,42 @@
-# Run: nohup python3 galaxyClf_ann.py --config galaxyClf_ann_config.yaml &
+# Usage:
+#   python galaxyClf_ann.py --config path/to/config.yaml
+#
+# Outputs land in {save_dir}/{experiment_name}/:
+#   config.yaml, scaler.pkl, best_model.pkl, checkpoint.pkl,
+#   training.log, metrics_curve.jpg, test_results.txt
 
-experiment_name: "1NoSpec_xSpec_NoErr"
+# ---------------------------------------------------------------
+# Experiment identity
+# ---------------------------------------------------------------
+experiment_name: "experiment_01"
 random_seed: 2025
-gpu_id: '1'
-save_dir: "./LSDR10/grzW1W2"
+gpu_id: '0'
+save_dir: "./runs"
 
+# ---------------------------------------------------------------
 # Model
+# ---------------------------------------------------------------
 model_class_name: 'GalaxyClassifier'
 model_params:
   hidden_dims: [512, 256, 128, 64]
   dropout_rate: 0.1
-  activation_function: 'relu'
+  activation_function: 'relu'    # relu | gelu | leaky_relu | elu | silu
   use_batch_norm: true
   use_layer_norm: false
   use_residual: true
 
+# ---------------------------------------------------------------
 # Dataset
+# ---------------------------------------------------------------
 dataset_class_name: 'DatasetGalaxyClassification'
 dataset_params:
-  # Label column for binary classification (galaxy=1, others=0)
+  # Binary label column (galaxy=1, others=0).
   label_column: 'label'
 
-  # PS1DR2
-  # feature_columns: [
-  #   # Magnitude features
-  #   'gKronMag_dered', 'rKronMag_dered', 'iKronMag_dered', 'zKronMag_dered', 'yKronMag_dered',
-  #   'gPSFMag_dered', 'rPSFMag_dered', 'iPSFMag_dered', 'zPSFMag_dered', 'yPSFMag_dered',
-  #   'gApMag_dered', 'rApMag_dered', 'iApMag_dered', 'zApMag_dered', 'yApMag_dered',
-  #   # Magnitude errors
-  #   'gKronMagErr', 'rKronMagErr', 'iKronMagErr', 'zKronMagErr', 'yKronMagErr',
-  #   'gPSFMagErr', 'rPSFMagErr', 'iPSFMagErr', 'zPSFMagErr', 'yPSFMagErr',
-  #   'gApMagErr', 'rApMagErr', 'iApMagErr', 'zApMagErr', 'yApMagErr',
-  # ]
-  # LSDR10
+  # Explicit feature columns. Example below is LS DR10 (g / r / z /
+  # W1 / W2 dereddened magnitudes). Swap in whatever your catalog
+  # provides, or use `feature_generation:` instead to auto-build
+  # the list via DatasetGalaxyClassification._choose_features.
   feature_columns: [
     'dered_mag_g', 'dered_mag_r',
     'dered_mag_z', 'dered_mag_w1', 'dered_mag_w2',
@@ -40,23 +44,33 @@ dataset_params:
     # 'mag_z_Err', 'mag_w1_Err', 'mag_w2_Err',
   ]
 
+  # PS1DR2 example (grizy × {Kron, PSF, Ap} + errors):
+  # feature_columns: [
+  #   'gKronMag_dered', 'rKronMag_dered', 'iKronMag_dered', 'zKronMag_dered', 'yKronMag_dered',
+  #   'gPSFMag_dered',  'rPSFMag_dered',  'iPSFMag_dered',  'zPSFMag_dered',  'yPSFMag_dered',
+  #   'gApMag_dered',   'rApMag_dered',   'iApMag_dered',   'zApMag_dered',   'yApMag_dered',
+  #   'gKronMagErr',    'rKronMagErr',    'iKronMagErr',    'zKronMagErr',    'yKronMagErr',
+  #   'gPSFMagErr',     'rPSFMagErr',     'iPSFMagErr',     'zPSFMagErr',     'yPSFMagErr',
+  #   'gApMagErr',      'rApMagErr',      'iApMagErr',      'zApMagErr',      'yApMagErr',
+  # ]
+
+# Mode 'files' requires explicit train/val/test paths below. Mode
+# 'ratio' splits a single file by random ratios — in that case set
+# dataset_params.file_path and dataset_mode.ratios instead.
 dataset_mode:
   type: 'files'
   paths:
-    # PS1DR2
-    # train: "/home/tiandc/photoz/galaxyClf/data/PS1DR2_r_trainset_train.fits"
-    # val: "/home/tiandc/photoz/galaxyClf/data/PS1DR2_r_trainset_val.fits"
-    # test: "/home/tiandc/photoz/galaxyClf/data/PS1DR2_r_trainset_test.fits"
-    # LSDR10
-    # 'train': "/home/tiandc/photoz/galaxyClf/data/LSDR10/NoSpec/LSDR10_NoSpec_train.fits"
-    # 'val': "/home/tiandc/photoz/galaxyClf/data/LSDR10/NoSpec/LSDR10_NoSpec_val.fits"
-    # 'test': "/home/tiandc/photoz/galaxyClf/data/LSDR10/NoSpec/LSDR10_NoSpec_test.fits"
-    # LSDR10 NoSpec_xSpec
-    'train': "/home/tiandc/photoz/galaxyClf/data/LSDR10/NoSpec_xSpec/LSDR10_NoSpec_xSpec_train.fits"
-    'val': "/home/tiandc/photoz/galaxyClf/data/LSDR10/NoSpec_xSpec/LSDR10_NoSpec_xSpec_val.fits"
-    'test': "/home/tiandc/photoz/galaxyClf/data/LSDR10/NoSpec_xSpec/LSDR10_NoSpec_xSpec_test.fits"
+    train: "/path/to/train.fits"
+    val:   "/path/to/val.fits"
+    test:  "/path/to/test.fits"
+  # ratios:
+  #   train: 0.8
+  #   val:   0.1
+  #   test:  0.1
 
-# Train
+# ---------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------
 batch_size: 4096
 epochs: 300
 early_stopping: 20
@@ -76,20 +90,22 @@ scheduler_config:
 
 gradient_clipping:
   enabled: true
-  method: 'norm'
+  method: 'norm'                 # norm | value
   max_norm: 1.0
 
-# Loss configuration for binary classification
+# ---------------------------------------------------------------
+# Loss (binary classification)
+# ---------------------------------------------------------------
+# type: bce | bce_logits | focal
+#   * bce          — BCELoss; expects probabilities (separate sigmoid).
+#   * bce_logits   — BCEWithLogitsLoss; expects raw logits from the
+#                    model, numerically more stable. Recommended.
+#   * focal        — FocalLoss (logits); useful for class-imbalanced
+#                    data. Reads focal_alpha / focal_gamma below.
+#
+# Evaluation reports Accuracy, Precision, Recall, F1, AUC-ROC, and
+# the confusion-matrix counts (TP / FP / TN / FN).
 loss_config:
-  type: 'bce_logits'  # Options: 'bce', 'bce_logits', 'focal'
-  # focal_alpha: 1.0    # For Focal loss (class weighting)
-  # focal_gamma: 2.0    # For Focal loss (focus on hard examples)
-
-# Notes:
-# - This is for binary classification: galaxy=1, others=0
-# - Loss functions available:
-#   * bce: Binary Cross Entropy (requires sigmoid output)
-#   * bce_logits: BCE with logits (more numerically stable, recommended)
-#   * focal: Focal loss - useful for imbalanced datasets
-# - Evaluation metrics include: Accuracy, Precision, Recall, F1, AUC-ROC
-# - For imbalanced datasets, consider using focal loss or adjusting class weights
+  type: 'bce_logits'
+  # focal_alpha: 1.0             # global / positive-class weighting
+  # focal_gamma: 2.0             # focusing exponent (0 = plain BCE)

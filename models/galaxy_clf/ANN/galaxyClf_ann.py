@@ -1,3 +1,31 @@
+"""Binary galaxy / non-galaxy classifier built on a feed-forward MLP.
+
+Pipeline at a glance
+--------------------
+1. :class:`DatasetGalaxyClassification` loads a catalog (FITS / HDF5
+   / CSV via :func:`lib.io.readfile`), picks feature columns, and
+   exposes a scalar ``{0, 1}`` label column.
+2. :class:`GalaxyClassifier` is a stack of ``Linear → Norm →
+   Activation → Dropout`` blocks (optionally residual) ending in a
+   single logit. Sigmoid is applied outside the model, either inside
+   :class:`FocalLoss` / :class:`~torch.nn.BCEWithLogitsLoss` during
+   training, or explicitly during inference.
+3. :class:`Trainer` glues dataset / model / loss / optimizer /
+   early-stopping together; :meth:`Trainer.run` executes the full
+   training + final test-set evaluation.
+4. :class:`GalaxyClassificationInference` loads a finished model
+   directory (``config.yaml`` + ``scaler.pkl`` + ``best_model.pkl``)
+   and exposes :meth:`predict` for deterministic inference or
+   MC-dropout uncertainty.
+
+This module is intentionally kept as a single file (vs. the
+package-style split used for the photo-z NNC / ANN models) because
+its scope is narrower and it is unlikely to grow further.
+
+Usage:
+    python galaxyClf_ann.py --config path/to/config.yaml
+"""
+
 import os
 import time
 import logging
@@ -25,8 +53,8 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 
 import joblib
 
-# External utils (same as original)
-import cosmic.utils as cu
+# Project-local I/O helpers (unified FITS / HDF5 / CSV reader).
+from lib.io import readfile
 
 
 # ============================
@@ -34,6 +62,25 @@ import cosmic.utils as cu
 # ============================
 @dataclass
 class Config:
+    """Training / inference config, kept in sync with ``config.yaml``.
+
+    Instantiate with defaults, then overlay YAML via
+    :meth:`update_from_yaml` or a plain dict via
+    :meth:`update_from_dict`. Unknown keys in the source are ignored
+    silently.
+
+    Top-level sections:
+
+    * **identity** — ``config_path``, ``save_dir``, ``experiment_name``,
+      ``random_seed``, ``gpu_id``.
+    * **model** — ``model_class_name`` (+ ``model_params`` dict).
+    * **data** — ``dataset_class_name`` (+ ``dataset_params`` dict),
+      ``dataset_mode`` (either explicit ``files`` paths or ``ratio``
+      split).
+    * **train** — optimizer / scheduler / batch / epoch / early
+      stopping / gradient clipping / loss.
+    """
+
     config_path: str = "config.yaml"
     save_dir: str = "."
     experiment_name: str = "galaxy_classification"
@@ -60,7 +107,7 @@ class Config:
     })
     scheduler_config: Dict[str, Any] = field(default_factory=lambda: {
         'name': 'ReduceLROnPlateau',
-        'params': {'mode': 'min', 'factor': 0.5, 'patience': 5, 'verbose': True}
+        'params': {'mode': 'min', 'factor': 0.5, 'patience': 5}
     })
     batch_size: int = 4096
     epochs: int = 200
@@ -75,18 +122,21 @@ class Config:
     })
 
     # Loss function configuration
+    #   type: 'bce' | 'bce_logits' | 'focal'
     loss_config: Dict[str, Any] = field(default_factory=lambda: {
-        'type': 'bce_logits',  # 'bce', 'bce_logits', 'focal'
-        'focal_alpha': 1.0,  # For Focal loss
-        'focal_gamma': 2.0   # For Focal loss
+        'type': 'bce_logits',
+        'focal_alpha': 1.0,  # For Focal loss (class weighting)
+        'focal_gamma': 2.0,  # For Focal loss (focus on hard examples)
     })
 
     def update_from_yaml(self, path: str):
+        """Overlay values from a YAML file onto this config."""
         with open(path, 'r') as f:
             cfg = yaml.safe_load(f)
         self.update_from_dict(cfg)
 
     def update_from_dict(self, d: Dict[str, Any]):
+        """Overlay values from a dict. Unknown keys are ignored."""
         for k, v in d.items():
             if hasattr(self, k):
                 setattr(self, k, v)
@@ -96,6 +146,39 @@ class Config:
 # Dataset for classification
 # ============================
 class DatasetGalaxyClassification(Dataset):
+    """Galaxy / non-galaxy catalog → PyTorch dataset.
+
+    Exactly one of ``dataset`` and ``file_path`` must be given. The
+    loaded frame must contain every feature column referenced by
+    ``feature_columns`` / ``feature_generation`` and, when
+    ``mode != 'inference'``, the ``label_column`` too.
+
+    Args:
+        dataset: In-memory DataFrame. Mutually exclusive with
+            ``file_path``.
+        file_path: Path to a catalog (any extension supported by
+            :func:`lib.io.readfile`). Mutually exclusive with
+            ``dataset``.
+        feature_generation: Optional spec passed to
+            :meth:`_choose_features`; must contain ``mag_types``,
+            ``color_types``, ``use_mag``, ``use_magerr``,
+            ``use_colorerr``.
+        feature_columns: Explicit list of column names. Takes
+            priority over ``feature_generation``.
+        label_column: Name of the binary label column (galaxy=1,
+            others=0). Defaults to ``"label"``.
+        scaler_X: Optional pre-fitted :class:`StandardScaler`;
+            applied to ``features`` at construction time.
+        mode: ``"train"`` / ``"validation"`` / ``"test"`` /
+            ``"inference"``. The first three expose ``labels``;
+            ``"inference"`` skips label processing.
+
+    Raises:
+        ValueError: Both or neither of ``dataset`` / ``file_path``,
+            or neither ``feature_columns`` nor ``feature_generation``.
+        FileNotFoundError: ``file_path`` does not exist.
+    """
+
     def __init__(self,
                  dataset: pd.DataFrame = None,
                  file_path: str = None,
@@ -105,7 +188,7 @@ class DatasetGalaxyClassification(Dataset):
                  scaler_X: StandardScaler = None,
                  mode: str = 'train'):
 
-        # data
+        # --- Source table ---
         if dataset is not None and file_path is not None:
             raise ValueError("Cannot specify both 'dataset' and 'file_path'.")
         if dataset is None and file_path is None:
@@ -114,11 +197,11 @@ class DatasetGalaxyClassification(Dataset):
         if file_path is not None:
             if not os.path.exists(file_path):
                 raise FileNotFoundError(f"Data file not found: {file_path}")
-            self.dataset = cu.readfile(file_path)
+            self.dataset = readfile(file_path)
         else:
             self.dataset = dataset
 
-        # feature
+        # --- Feature columns ---
         if feature_columns is not None:
             self.feature_cols = feature_columns
         elif feature_generation is not None:
@@ -136,19 +219,25 @@ class DatasetGalaxyClassification(Dataset):
             raise ValueError("Either 'feature_columns' or 'feature_generation' must be provided")
         self.features = self.dataset[self.feature_cols].values.astype(np.float32)
 
-        # mode
+        # --- Labels ---
         self.mode = mode
         self.label_column = label_column
         if self.mode in ['train', 'validation', 'test']:
             # Binary classification labels: galaxy=1, others=0
             self.labels = self.dataset[label_column].values.astype(np.float32)
 
-        # scaler
+        # --- Standardisation ---
         if scaler_X is not None:
             self.scaler_X = scaler_X
             self.features = self.scaler_X.transform(self.features)
 
     def _choose_features(self, mag_types, color_types, use_mag=True, use_magerr=True, use_colorerr=True):
+        """Build the feature column list for the grizy PS1 / LS layout.
+
+        Survey-specific: assumes ``grizy`` bands and the adjacent-band
+        colours ``gr / ri / iz / zy``. Override / replace if adapting
+        to a different band set.
+        """
         bands = ['g', 'r', 'i', 'z', 'y']
         colours = ['gr', 'ri', 'iz', 'zy']
         mag_cols, err_cols = [], []
@@ -180,6 +269,7 @@ class DatasetGalaxyClassification(Dataset):
 # ============================
 # Model
 # ============================
+#: String → ``nn.Module`` factory for supported activation functions.
 ACTIVATION_FUNCTIONS = {
     'relu': nn.ReLU,
     'gelu': nn.GELU,
@@ -190,6 +280,36 @@ ACTIVATION_FUNCTIONS = {
 
 
 class GalaxyClassifier(nn.Module):
+    """MLP that outputs a single logit for binary classification.
+
+    Architecture: a stack of ``Linear → Norm → Activation → Dropout``
+    blocks, optionally with residual skips (a learned projection when
+    input/output widths differ, Identity when they match), ending in
+    a single linear head. Sigmoid is *not* applied inside ``forward``
+    so that the output can feed straight into
+    :class:`~torch.nn.BCEWithLogitsLoss` (numerically stable); apply
+    ``torch.sigmoid`` explicitly at inference time to get
+    probabilities.
+
+    Args:
+        input_dim: Number of input features.
+        hidden_dims: Widths of the hidden layers. ``None`` falls
+            back to ``[512, 256, 128, 64]``.
+        dropout_rate: Dropout probability after the activation.
+            Pass ``0`` to disable.
+        activation_function: Key into :data:`ACTIVATION_FUNCTIONS`.
+        use_batch_norm: Insert :class:`~torch.nn.BatchNorm1d` after
+            each hidden linear.
+        use_layer_norm: Insert :class:`~torch.nn.LayerNorm` instead.
+            Ignored (with a warning) when ``use_batch_norm`` is also
+            ``True``.
+        use_residual: Add a residual skip around every hidden block.
+
+    Raises:
+        ValueError: ``activation_function`` is not in
+            :data:`ACTIVATION_FUNCTIONS`.
+    """
+
     def __init__(self,
                  input_dim: int,
                  hidden_dims: list = None,
@@ -227,6 +347,8 @@ class GalaxyClassifier(nn.Module):
                 blocks.append(nn.Dropout(dropout_rate))
             self.layers.append(nn.Sequential(*blocks))
             if use_residual:
+                # Identity skip when widths match, learned projection
+                # otherwise so the residual add is well-defined.
                 self.residual_layers.append(nn.Linear(in_dim, h) if in_dim != h else nn.Identity())
             else:
                 self.residual_layers.append(None)
@@ -237,6 +359,7 @@ class GalaxyClassifier(nn.Module):
         self._initialize_weights()
 
     def _initialize_weights(self):
+        """Kaiming-normal init for linear layers; 1/0 for norm layers."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -250,6 +373,7 @@ class GalaxyClassifier(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x: Tensor) -> Tensor:
+        """Return a raw logit of shape ``(batch, 1)`` (no sigmoid)."""
         for layer, res in zip(self.layers, self.residual_layers):
             identity = x
             out = layer(x)
@@ -264,6 +388,7 @@ class GalaxyClassifier(nn.Module):
 # Optimizer & Scheduler
 # ============================
 def get_optimizer(parameters: Iterable[torch.nn.Parameter], config: Dict[str, Any]) -> optim.Optimizer:
+    """Build an optimizer by name from :mod:`torch.optim`."""
     name = config.get('name', 'AdamW')
     params = config.get('params', {})
     opt_cls = getattr(optim, name, None)
@@ -273,6 +398,12 @@ def get_optimizer(parameters: Iterable[torch.nn.Parameter], config: Dict[str, An
 
 
 def get_scheduler(optimizer: optim.Optimizer, config: Dict[str, Any], training_context: Dict[str, Any] = None) -> _LRScheduler:
+    """Build an LR scheduler by name; return ``None`` when disabled.
+
+    ``training_context`` may carry ``epochs`` so that
+    :class:`~torch.optim.lr_scheduler.CosineAnnealingLR` can default
+    ``T_max`` when the user did not set it.
+    """
     if not config or not config.get('name'):
         return None
     name = config['name']
@@ -289,6 +420,14 @@ def get_scheduler(optimizer: optim.Optimizer, config: Dict[str, Any], training_c
 # Utils
 # ============================
 class EarlyStopping:
+    """Early stopping with best-checkpoint bookkeeping.
+
+    Tracks validation loss and stops training when it fails to
+    improve (by more than ``delta``) for ``patience`` consecutive
+    epochs. The best model is saved to both ``checkpoint_path``
+    (latest best) and ``best_model_path`` (kept for later inference).
+    """
+
     def __init__(self, patience: int, checkpoint_path: Union[str, Path], best_model_path: Union[str, Path], verbose: bool = True, delta: float = 0):
         self.patience = patience
         self.verbose = verbose
@@ -325,7 +464,25 @@ class EarlyStopping:
 
 
 def calculate_classification_metrics(y_true: np.ndarray, y_pred_proba: np.ndarray, running_loss: float, num_batches: int) -> Dict[str, float]:
-    """Calculate classification metrics for binary classification."""
+    """Compute standard binary-classification metrics + confusion counts.
+
+    Uses a fixed 0.5 threshold to turn probabilities into hard
+    predictions. AUC-ROC is computed from the raw probabilities and
+    falls back to 0 when only one class is present in ``y_true``
+    (:func:`sklearn.metrics.roc_auc_score` raises in that case).
+
+    Args:
+        y_true: ``(n,)`` ground-truth labels (0 / 1).
+        y_pred_proba: ``(n,)`` predicted probability of class 1.
+        running_loss: Sum of per-batch losses.
+        num_batches: Number of batches contributing to
+            ``running_loss``.
+
+    Returns:
+        Dict with ``loss``, ``accuracy``, ``precision``, ``recall``,
+        ``f1``, ``auc``, and confusion-matrix counts ``tp`` / ``fp``
+        / ``tn`` / ``fn``.
+    """
     # Convert probabilities to binary predictions
     y_pred = (y_pred_proba >= 0.5).astype(int)
     y_true_int = y_true.astype(int)
@@ -362,7 +519,19 @@ def calculate_classification_metrics(y_true: np.ndarray, y_pred_proba: np.ndarra
 # Loss Functions
 # ============================
 class FocalLoss(nn.Module):
-    """Focal Loss for binary classification."""
+    """Focal loss for binary classification.
+
+    Down-weights the contribution of easy examples via
+    ``(1 - p_t) ** gamma``; useful when the positive class is rare.
+    ``gamma = 0`` recovers plain BCE (weighted by ``alpha``).
+
+    Args:
+        alpha: Global scaling / positive-class weighting. Defaults
+            to 1.0.
+        gamma: Focusing exponent. Higher = more weight on hard
+            examples. Defaults to 2.0.
+    """
+
     def __init__(self, alpha: float = 1.0, gamma: float = 2.0):
         super().__init__()
         self.alpha = alpha
@@ -376,7 +545,17 @@ class FocalLoss(nn.Module):
 
 
 def get_loss_function(config: Dict[str, Any]) -> callable:
-    """Get the loss function based on configuration."""
+    """Map a ``loss_config`` dict to a concrete loss module.
+
+    Supported ``type`` values:
+
+    * ``"bce"`` — :class:`~torch.nn.BCELoss` (expects probabilities,
+      i.e. a separate sigmoid on the model output).
+    * ``"bce_logits"`` — :class:`~torch.nn.BCEWithLogitsLoss`
+      (expects logits; numerically more stable; **recommended**).
+    * ``"focal"`` — :class:`FocalLoss` (expects logits). Reads
+      ``focal_alpha`` and ``focal_gamma`` from ``config``.
+    """
     loss_type = config.get('type', 'bce_logits')
 
     if loss_type == 'bce':
@@ -395,6 +574,15 @@ def get_loss_function(config: Dict[str, Any]) -> callable:
 # Trainer
 # ============================
 class Trainer:
+    """Top-level training loop for the galaxy classifier.
+
+    One-shot usage: build a :class:`Config`, instantiate ``Trainer``,
+    call :meth:`run`. The trainer takes care of seeding, data loader
+    construction, scaler fitting + saving, model instantiation,
+    per-epoch logging, early stopping, metric curve plotting, and a
+    final evaluation on the test set.
+    """
+
     def __init__(self, config: Config):
         self.config = config
         self.device = None
@@ -414,6 +602,7 @@ class Trainer:
         self.loss_function = None
 
     def _setup(self):
+        """Run every setup step in the correct order."""
         self._setup_seed()
         self._setup_logging()
         self._setup_device()
@@ -424,6 +613,7 @@ class Trainer:
         self._setup_early_stopping()
 
     def _setup_seed(self):
+        """Seed torch / numpy + enable deterministic cuDNN."""
         seed = self.config.random_seed
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
@@ -432,6 +622,8 @@ class Trainer:
         torch.backends.cudnn.benchmark = False
 
     def _setup_logging(self):
+        """Create ``{save_dir}/{experiment_name}/``, set up logging,
+        and dump a frozen copy of the config."""
         self.logdir = Path(f"{self.config.save_dir}/{self.config.experiment_name}")
         self.logdir.mkdir(parents=True, exist_ok=True)
         log_path = self.logdir / 'training.log'
@@ -446,11 +638,17 @@ class Trainer:
             yaml.dump(asdict(self.config), f, default_flow_style=False, sort_keys=False)
 
     def _setup_device(self):
+        """Pin CUDA visibility to ``gpu_id`` and pick cuda/cpu."""
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self.config.gpu_id)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logging.info(f"Using device: {self.device}")
 
     def _create_datasets_from_paths(self, paths: Dict[str, str]):
+        """Build train / val / test dataloaders from explicit paths.
+
+        The scaler is **fit on the training set only** before any
+        split is wrapped for iteration.
+        """
         # Fit scaler on train
         tmp_train = DatasetGalaxyClassification(file_path=paths['train'],
                                            feature_generation=self.config.dataset_params.get('feature_generation'),
@@ -487,6 +685,7 @@ class Trainer:
         logging.info(f"Data loaded from paths: {len(train_ds)} train, {len(val_ds)} val, {len(test_ds)} test samples.")
 
     def _setup_data(self):
+        """Dispatch on ``dataset_mode.type`` (``files`` or ``ratio``)."""
         mode_type = self.config.dataset_mode.get('type', 'files')
         if mode_type == 'files':
             paths = self.config.dataset_mode.get('paths', {})
@@ -494,7 +693,9 @@ class Trainer:
                 raise ValueError("When using 'files' mode, all paths (train, val, test) must be specified")
             self._create_datasets_from_paths(paths)
         elif mode_type == 'ratio':
-            dataset = cu.readfile(self.config.dataset_params.get('file_path'))
+            # Single-file mode: random-split once, then wrap each split
+            # in a Subset that shares the underlying Dataset + scaler.
+            dataset = readfile(self.config.dataset_params.get('file_path'))
             total = len(dataset)
             indices = list(range(total))
             ratios = self.config.dataset_mode.get('ratios', {'train': 0.8, 'val': 0.1, 'test': 0.1})
@@ -539,6 +740,13 @@ class Trainer:
         self._save_scaler()
 
     def _setup_model(self):
+        """Instantiate the model class named in ``config.model_class_name``.
+
+        Input dim is inferred from the first training batch; the
+        class name is resolved from module globals, which means any
+        custom classifier defined in this same file is picked up
+        automatically.
+        """
         sample_batch = next(iter(self.trainloader))
         input_dim = sample_batch['input'].shape[1]
         model_params = self.config.model_params.copy()
@@ -554,9 +762,9 @@ class Trainer:
         self.scheduler = get_scheduler(self.optimizer, self.config.scheduler_config, {'epochs': self.config.epochs})
 
     def _setup_loss_function(self):
-        """Setup loss function."""
+        """Build the loss module from ``config.loss_config``."""
         self.loss_function = get_loss_function(self.config.loss_config)
-        logging.info(f"Using loss function: {self.config.loss_config.get('type', 'mse')}")
+        logging.info(f"Using loss function: {self.config.loss_config.get('type', 'bce_logits')}")
 
     def _setup_early_stopping(self):
         if self.config.early_stopping > 0:
@@ -571,6 +779,7 @@ class Trainer:
         logging.info(f"Scaler saved to {scaler_path}")
 
     def _train_epoch(self):
+        """Run a single training epoch and return per-epoch metrics."""
         self.model.train()
         running_loss = 0.0
         all_labels, all_preds = [], []
@@ -603,6 +812,7 @@ class Trainer:
 
     @torch.no_grad()
     def _evaluate(self, loader: DataLoader) -> Dict[str, float]:
+        """Evaluate on ``loader`` and return aggregate metrics."""
         self.model.eval()
         running_loss = 0.0
         all_labels, all_preds = [], []
@@ -623,6 +833,7 @@ class Trainer:
         return calculate_classification_metrics(np.array(all_labels), np.array(all_preds), running_loss, len(loader))
 
     def _update_and_log(self, epoch, train_metrics, val_metrics, duration):
+        """Log one epoch's numbers + step the LR scheduler."""
         for metric in self.train_metrics.keys():
             self.train_metrics[metric].append(train_metrics[metric])
             self.val_metrics[metric].append(val_metrics[metric])
@@ -639,6 +850,7 @@ class Trainer:
         logging.info(f"Current LR: {self.optimizer.param_groups[0]['lr']:.6f}")
 
     def _plot_metrics(self):
+        """Render the 6-panel train / val metric curve and save to disk."""
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         metrics_map = {'loss': 'Loss', 'accuracy': 'Accuracy', 'precision': 'Precision', 'recall': 'Recall', 'f1': 'F1 Score', 'auc': 'AUC-ROC'}
         for ax, (metric, title) in zip(axes.flatten(), metrics_map.items()):
@@ -653,6 +865,7 @@ class Trainer:
         plt.close()
 
     def run(self):
+        """Full training + final test-set evaluation."""
         self._setup()
         logging.info("--- Starting Training ---")
         for epoch in range(self.config.epochs):
@@ -672,6 +885,7 @@ class Trainer:
         torch.cuda.empty_cache()
 
     def _test(self):
+        """Restore the best checkpoint and evaluate on the test loader."""
         logging.info("--- Starting Testing ---")
         best_model_path = self.logdir / 'best_model.pkl'
         if not best_model_path.exists():
@@ -692,6 +906,21 @@ class Trainer:
 # Inference helper
 # ============================
 class GalaxyClassificationInference:
+    """Load a saved model directory and run inference on new data.
+
+    Expects ``model_dir`` to contain the files produced by a
+    successful :meth:`Trainer.run` — ``config.yaml``, ``scaler.pkl``,
+    and at least one of ``best_model.pkl`` / ``checkpoint.pkl``.
+
+    Args:
+        model_dir: Path to the experiment directory.
+        device: Torch device string (``"cuda"``, ``"cuda:0"``,
+            ``"cpu"``). Falls back to CPU with a warning when CUDA
+            is requested but unavailable.
+        batch_size: Default inference batch size.
+        num_workers: ``DataLoader`` ``num_workers``.
+    """
+
     def __init__(self, model_dir: str, device: str = 'cuda:0', batch_size: int = 4096, num_workers: int = 4):
         self.model_dir = Path(model_dir)
         self.device = self._setup_device(device)
@@ -719,6 +948,7 @@ class GalaxyClassificationInference:
         return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     def _load_model(self):
+        """Locate the checkpoint, reconstruct the model, load weights."""
         model_path = self.model_dir / 'best_model.pkl'
         if not model_path.exists():
             model_path = self.model_dir / 'checkpoint.pkl'
@@ -737,6 +967,7 @@ class GalaxyClassificationInference:
         self.model.eval()
 
     def _create_dataset(self, data_source):
+        """Wrap ``data_source`` (path or DataFrame) as an inference dataset."""
         if isinstance(data_source, str):
             ds = DatasetGalaxyClassification(file_path=data_source,
                                         feature_generation=self.config.dataset_params.get('feature_generation'),
@@ -753,17 +984,23 @@ class GalaxyClassificationInference:
 
     @torch.no_grad()
     def predict(self, data_source, batch_size: int = None, return_uncertainty: bool = False, threshold: float = 0.5):
-        """
-        Predict galaxy classification for given data.
+        """Predict galaxy-class probabilities for the given data.
 
         Args:
-            data_source: Input data (file path or DataFrame)
-            batch_size: Batch size for inference
-            return_uncertainty: If True, use dropout for uncertainty estimation
-            threshold: Classification threshold (default 0.5)
+            data_source: Input data (file path or DataFrame).
+            batch_size: Override the default batch size.
+            return_uncertainty: If ``True``, keep dropout active at
+                inference time and run 100 stochastic forward passes
+                per batch (MC-dropout), returning the mean as the
+                prediction and the standard deviation as the
+                uncertainty.
+            threshold: Classification threshold applied to the mean
+                probability to produce hard ``predictions``.
 
         Returns:
-            Dictionary with predictions (probabilities and classes)
+            Dict with ``probabilities`` ``(n,)`` and ``predictions``
+            ``(n,)``; plus ``uncertainties`` ``(n,)`` when
+            ``return_uncertainty=True``.
         """
         ds = self._create_dataset(data_source)
         if batch_size is None:
@@ -813,8 +1050,9 @@ class GalaxyClassificationInference:
 # Main
 # ============================
 def main():
+    """CLI entry point: load a YAML config and run training."""
     parser = argparse.ArgumentParser(description="Train a classification model for galaxy classification.")
-    parser.add_argument('--config', type=str, default='galaxyClf_ann/config_classification.yaml', help="Path to the config.yaml file.")
+    parser.add_argument('--config', type=str, default='config.yaml', help="Path to the config.yaml file.")
     args = parser.parse_args()
 
     config = Config()
