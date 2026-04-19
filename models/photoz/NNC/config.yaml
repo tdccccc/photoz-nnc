@@ -1,0 +1,158 @@
+# Usage:
+#   python -m models.photoz.NNC.train --config path/to/config.yaml
+#
+# Outputs land in {save_dir}/{experiment_name}/:
+#   config.yaml, scaler.pkl, best_model.pkl, checkpoint.pkl,
+#   training.log, metrics_curve.jpg, pit_epoch_*.png, pit_test.png,
+#   test_results.txt
+
+# ---------------------------------------------------------------
+# Experiment identity
+# ---------------------------------------------------------------
+experiment_name: "experiment_01"
+random_seed: 2025
+gpu_id: "0"
+save_dir: "./runs"
+
+# ---------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------
+model_class_name: "PhotozBinningClassifier"
+model_params:
+  hidden_dims: [512, 256, 128, 64]
+  dropout_rate: 0.1
+  activation_function: "relu"   # relu | gelu | leaky_relu | elu | silu
+  use_batch_norm: true
+  use_layer_norm: false
+  use_residual: true
+
+# ---------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------
+dataset_class_name: "DatasetPhotozBinned"
+dataset_params:
+  label_column: "z"
+
+  # Redshift binning grid used by both the soft labels and the
+  # output layer of the classifier.
+  binning_config:
+    z_min: 0.0
+    z_max: 2.0
+    num_bins: 400
+    soft_label_width: 0.1        # in bin units; null to disable Gaussian smoothing
+
+  # Feature columns. Either supply `feature_columns` with an
+  # explicit list (recommended) or `feature_generation` with the
+  # spec consumed by DatasetPhotozBinned._choose_features.
+  #
+  # Example: Legacy Surveys DR10 g/r/i/z + WISE W1/W2 magnitudes and errors.
+  feature_columns: [
+    "dered_mag_g", "dered_mag_r", "dered_mag_i",
+    "dered_mag_z", "dered_mag_w1", "dered_mag_w2",
+    "mag_g_Err", "mag_r_Err", "mag_i_Err",
+    "mag_z_Err", "mag_w1_Err", "mag_w2_Err",
+  ]
+
+# Mode 'files' requires explicit train/val/test paths.
+# Mode 'ratio' splits a single file by random ratios; in that case
+# set dataset_params.file_path and dataset_mode.ratios below.
+dataset_mode:
+  type: "files"
+  paths:
+    train: "/path/to/train.fits"
+    val:   "/path/to/val.fits"
+    test:  "/path/to/test.fits"
+  # ratios:
+  #   train: 0.8
+  #   val:   0.1
+  #   test:  0.1
+
+# ---------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------
+batch_size: 4096
+epochs: 300
+early_stopping: 20
+
+optimizer_config:
+  name: "AdamW"
+  params:
+    lr: 0.0001
+    weight_decay: 0.0001
+
+scheduler_config:
+  name: "ReduceLROnPlateau"
+  params:
+    mode: min
+    factor: 0.5
+    patience: 5
+
+gradient_clipping:
+  enabled: true
+  method: "norm"                 # norm | value
+  max_norm: 0.5
+
+# ---------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------
+# type: kl_divergence | weighted_kl | focal | anchor | crps | emd | combined
+loss_config:
+  type: "kl_divergence"
+
+  # bin_weights:                  # counteract bin-level imbalance
+  #   enabled: false
+  #   method: "inverse_frequency" # inverse_frequency | balanced | sqrt_inverse
+  #
+  # focal:
+  #   alpha: 1.0
+  #   gamma: 2.0
+  #
+  # anchor:                       # Ryou+2019; Lee & Shin 2021 for photo-z
+  #   gamma: 0.5                  # 0 = plain CE; typical 0.2 / 0.5 / 1.0
+  #   slack: 0.05
+  #   anchor: "neg"               # "neg" (max non-target prob) or "pos"
+  #
+  # combined:                     # mix multiple components
+  #   components:
+  #     - {type: "kl",   weight: 0.5}
+  #     - {type: "crps", weight: 0.5}
+  #     # - {type: "focal", weight: 0.2, params: {alpha: 1.0, gamma: 2.0}}
+  #     # - {type: "emd",   weight: 0.1}
+  #     # - {type: "brier", weight: 0.1}
+  #   entropy_reg: 0.0            # subtract entropy_reg * H(softmax) to smooth
+  #   z_weights:                  # per-redshift-range sample weight
+  #     enabled: false
+  #     ranges:
+  #       - {z_min: 0.0, z_max: 0.3, weight: 1.0}
+  #       - {z_min: 0.3, z_max: 0.6, weight: 1.5}
+  #       - {z_min: 0.6, z_max: 1.2, weight: 2.0}
+
+# ---------------------------------------------------------------
+# Optional: balanced batch sampling
+# ---------------------------------------------------------------
+# sampling_config:
+#   balanced_sampling:
+#     enabled: false
+#     bins: 10
+#     z_min: 0.0
+#     z_max: 1.2
+
+# ---------------------------------------------------------------
+# PIT monitoring during training
+# ---------------------------------------------------------------
+pit_config:
+  enabled: true                  # compute PIT during training
+  monitor_interval: 10           # compute PIT every N epochs
+  n_bins: 20                     # histogram bins for PIT
+  plot: true                     # save PIT diagnostic plots
+  plot_interval: 20              # save a plot every N epochs
+
+# ---------------------------------------------------------------
+# Temperature-scaling calibration — run AFTER training
+# ---------------------------------------------------------------
+# Typical usage:
+#   from models.photoz.NNC.inference import PhotozBinInference
+#   infer = PhotozBinInference("runs/experiment_01/")
+#   infer.calibrate("validation.fits", save_path="calibrator")  # fit + save
+#   infer.load_calibrator("calibrator.pkl")                     # or reload
+#   result = infer.predict("test.fits")                         # auto-applied

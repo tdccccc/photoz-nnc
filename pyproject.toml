@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photoz-nnc"
+version = "0.1.0"
+description = "Photometric redshift neural-network classifier and shared tooling"
+requires-python = ">=3.10"
+
+# Packages we expose to the environment via `pip install -e .`:
+# - lib       : shared utilities (io, metrics, pit, ...)
+# - surveys.* : per-survey helpers (PS1DR2 extinction, PS1 stellar mass, ...)
+# - models.*  : per-algorithm training/predict scripts (NNC, ANN, XGBoost, ...)
+#
+# legacy/, catalog/, figures/, joins/, pipelines/ are NOT packaged — they
+# hold reference snapshots and Markdown docs.
+#
+# namespaces = true lets us leave __init__.py out of intermediate
+# directories (surveys/, models/, models/photoz/, ...). Only leaf
+# packages that actually hold code need an __init__.py.
+[tool.setuptools.packages.find]
+include = ["lib*", "surveys*", "models*"]
+namespaces = true
