@@ -1,9 +1,9 @@
 # KNN Photometric Redshift Configuration
 
 # Basic settings
-save_dir: "./exp"
-experiment_name: "0test"
-random_seed: 2025
+save_dir: "./experiments"
+experiment_name: "example_knn"
+random_seed: 42
 
 # Evaluation optimization
 train_subsample: 2000000       # Subsample training set to 1M (set to null to disable)
@@ -47,9 +47,9 @@ dataset_mode:
 
   # For 'files' mode - specify separate train/val/test files
   paths:
-    train: "/home/tiandc/panstarrs/panstarrs_desi/data/DESIDR1_xSDSSDR19_xps1dr2phot_clean_train.fits"
-    val: "/home/tiandc/panstarrs/panstarrs_desi/data/DESIDR1_xSDSSDR19_xps1dr2phot_clean_val.fits"
-    test: "/home/tiandc/panstarrs/panstarrs_desi/data/DESIDR1_xSDSSDR19_xps1dr2phot_clean_test.fits"
+    train: "/path/to/train.fits"
+    val: "/path/to/val.fits"
+    test: "/path/to/test.fits"
 
   # For 'ratio' mode - split single file
   # file_path: "/path/to/full_data.fits"

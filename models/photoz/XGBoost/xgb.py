@@ -1,41 +1,40 @@
-"""XGBoost galaxy / non-galaxy binary classifier.
+"""XGBoost photometric redshift estimator.
 
-Thin wrapper around :class:`xgboost.XGBClassifier` that shares the
-configuration and directory conventions used by the NNC (``photoz_bin``),
-Random Forest, and XGBoost photo-z trainers, so results across model
-families stay directly comparable.
+Thin wrapper around :class:`xgboost.XGBRegressor` that shares the
+configuration and directory conventions used by the NNC (``photoz_bin``)
+and Random Forest trainers, so results across model families stay directly
+comparable.
 
 Typical workflow:
 
-1. Build a :class:`GalaxyXGBConfig` (or load it from YAML).
-2. Instantiate :class:`GalaxyXGBClassifier` -- this loads the train/val/test
-   data and fits a :class:`~sklearn.preprocessing.StandardScaler` on the
-   training features (if enabled).
-3. Call :meth:`GalaxyXGBClassifier.fit` (which uses the validation split for
-   early stopping) and :meth:`GalaxyXGBClassifier.evaluate` to train, score,
-   plot confusion matrix/ROC curves, and persist results.
+1. Build a :class:`PhotozXGBConfig` (or load it from YAML).
+2. Instantiate :class:`PhotozXGBoost` -- this loads the train/val/test data
+   and fits a :class:`~sklearn.preprocessing.StandardScaler` on the training
+   features.
+3. Call :meth:`PhotozXGBoost.fit` (which uses the validation split for early
+   stopping) and :meth:`PhotozXGBoost.evaluate`.
 4. For later predictions on new files, load the saved experiment with
-   :class:`GalaxyXGBInference`.
+   :class:`PhotozXGBInference`.
 
-Labels are expected in a single column (``label_column``) with ``1`` for
-galaxies and ``0`` for everything else (stars, QSOs, etc). ``predict``
-returns both a hard class prediction and the positive-class probability.
+Unlike Random Forest, gradient-boosted trees do not provide a cheap
+per-sample uncertainty -- ``return_uncertainty=True`` currently returns an
+array of NaNs and is kept only as a placeholder for future work.
 """
 
 import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
 import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import (accuracy_score, precision_score, recall_score,
-                             f1_score, roc_auc_score, confusion_matrix,
-                             classification_report, roc_curve)
+from sklearn.metrics import mean_squared_error, r2_score
 import warnings
 warnings.filterwarnings('ignore')
 
 import cosmic.utils as cu
+from cosmic.panstarrs_dr2 import ColorCalculator
 from dataclasses import dataclass, field, asdict
 from typing import Dict, Any, List
 import yaml
@@ -46,22 +45,22 @@ import joblib
 # Config
 #============================================================
 @dataclass
-class GalaxyXGBConfig:
-    """Configuration for :class:`GalaxyXGBClassifier`.
+class PhotozXGBConfig:
+    """Configuration for :class:`PhotozXGBoost`.
 
     Values can be set at construction, loaded from YAML via
     :meth:`update_from_yaml`, or round-tripped with :meth:`save_to_yaml`. The
-    attribute layout mirrors the photo-z XGB config so cross-task
+    attribute layout mirrors the NNC and RF configs so cross-model
     experiments stay directly comparable without extra bookkeeping.
     """
 
     # Experiment setup
     config_path: str = "config.yaml"
     save_dir: str = "."
-    experiment_name: str = "galaxy_classification_xgb"
+    experiment_name: str = "base_xgb_experiment"
     random_seed: int = 42
 
-    # Dataset configuration
+    # Dataset configuration (similar to photoz_bin)
     dataset_params: Dict[str, Any] = field(default_factory=lambda: {
         'feature_generation': {
             'mag_types': ['Kron', 'PSF', 'Ap'],
@@ -70,8 +69,7 @@ class GalaxyXGBConfig:
             'use_magerr': True,
             'use_colorerr': False
         },
-        'feature_columns': None,  # Alternative: specify columns directly
-        'label_column': 'label'   # Column name for classification labels (galaxy=1, others=0)
+        'feature_columns': None  # Alternative: specify columns directly
     })
 
     dataset_mode: Dict[str, Any] = field(default_factory=lambda: {
@@ -89,7 +87,7 @@ class GalaxyXGBConfig:
         'data_path': None  # Used when type='ratio'
     })
 
-    # XGBoost parameters for classification
+    # XGBoost parameters
     model_params: Dict[str, Any] = field(default_factory=lambda: {
         'n_estimators': 100,
         'max_depth': 6,
@@ -100,10 +98,9 @@ class GalaxyXGBConfig:
         'gamma': 0.0,
         'reg_alpha': 0.0,
         'reg_lambda': 1.0,
-        'objective': 'binary:logistic',
-        'eval_metric': 'logloss',
-        'early_stopping_rounds': 50,
-        'scale_pos_weight': 1.0  # For imbalanced datasets
+        'objective': 'reg:squarederror',
+        'eval_metric': 'rmse',
+        'early_stopping_rounds': 50
     })
 
     # Feature scaling
@@ -221,31 +218,27 @@ def choose_features(feature_generation: dict = None,
     return combined_cols
 
 
-class GalaxyXGBClassifier:
-    """End-to-end XGBoost binary galaxy/non-galaxy classifier.
+class PhotozXGBoost:
+    """End-to-end XGBoost photo-z trainer.
 
     On construction the class loads the train/val/test data (either from
     three files or by splitting a single file), fits a
-    :class:`~sklearn.preprocessing.StandardScaler` on the training features
-    (if enabled), and prepares an unfitted :class:`xgboost.XGBClassifier`.
-    Call :meth:`fit` and then :meth:`evaluate` to complete the workflow.
+    :class:`~sklearn.preprocessing.StandardScaler` on the training features,
+    and prepares an unfitted :class:`xgboost.XGBRegressor`. Call :meth:`fit`
+    and then :meth:`evaluate` to complete the workflow.
 
     :meth:`fit` uses the validation split (pre-loaded or carved out from the
-    training set on the fly) for early stopping. :meth:`evaluate` reports
-    accuracy / precision / recall / F1 / AUC-ROC and renders a four-panel
-    summary plot (train & test confusion matrices, ROC curves, probability
-    distribution). The positive class (``1``) is "galaxy".
+    training set on the fly) for early stopping. XGBoost does not expose a
+    cheap per-sample uncertainty, so :meth:`predict` with
+    ``return_uncertainty=True`` currently returns NaNs.
     """
 
-    def __init__(self, config: GalaxyXGBConfig):
+    def __init__(self, config: PhotozXGBConfig):
         self.config = config
         self.train_df = None
         self.val_df = None
         self.test_df = None
         self.scaler_X = None
-
-        # Get label column name
-        self.label_column = config.dataset_params.get('label_column', 'label')
 
         # Generate features based on config
         dataset_params = config.dataset_params
@@ -255,9 +248,8 @@ class GalaxyXGBClassifier:
         )
         self.n_features = len(self.features_names)
 
-        # Initialize XGBoost Classifier with config parameters
+        # Initialize XGBoost with config parameters
         model_params = config.model_params
-        self.early_stopping_rounds = model_params.get('early_stopping_rounds', 50)
         self.xgb_params = {
             'n_estimators': model_params.get('n_estimators', 100),
             'max_depth': model_params.get('max_depth', 6),
@@ -268,16 +260,15 @@ class GalaxyXGBClassifier:
             'gamma': model_params.get('gamma', 0.0),
             'reg_alpha': model_params.get('reg_alpha', 0.0),
             'reg_lambda': model_params.get('reg_lambda', 1.0),
-            'objective': model_params.get('objective', 'binary:logistic'),
-            'eval_metric': model_params.get('eval_metric', 'logloss'),
-            'scale_pos_weight': model_params.get('scale_pos_weight', 1.0),
+            'objective': model_params.get('objective', 'reg:squarederror'),
+            'eval_metric': model_params.get('eval_metric', 'rmse'),
             'random_state': config.random_seed,
             'n_jobs': -1,
-            'verbosity': 0,
-            'early_stopping_rounds': self.early_stopping_rounds,
+            'verbosity': 0
         }
+        self.early_stopping_rounds = model_params.get('early_stopping_rounds', 50)
 
-        self.xgb_model = xgb.XGBClassifier(**self.xgb_params)
+        self.xgb_model = xgb.XGBRegressor(**self.xgb_params)
         self.is_trained = False
 
         # Load data based on config
@@ -287,11 +278,10 @@ class GalaxyXGBClassifier:
     def _print_params(self):
         """Pretty-print the effective config and feature list."""
         print("=" * 60)
-        print("XGBoost Classification Model Parameters")
+        print("XGBoost Model Parameters")
         print("=" * 60)
         print(f"{'experiment_name':18s}: {self.config.experiment_name}")
         print(f"{'save_dir':18s}: {self.config.save_dir}")
-        print(f"{'label_column':18s}: {self.label_column}")
 
         model_params = self.config.model_params
         print(f"{'n_estimators':18s}: {model_params.get('n_estimators', 100)}")
@@ -303,7 +293,6 @@ class GalaxyXGBClassifier:
         print(f"{'gamma':18s}: {model_params.get('gamma', 0.0)}")
         print(f"{'reg_alpha':18s}: {model_params.get('reg_alpha', 0.0)}")
         print(f"{'reg_lambda':18s}: {model_params.get('reg_lambda', 1.0)}")
-        print(f"{'scale_pos_weight':18s}: {model_params.get('scale_pos_weight', 1.0)}")
         print(f"{'random_seed':18s}: {self.config.random_seed}")
         print(f"{'use_scaler':18s}: {self.config.use_scaler}")
         print(f"{'n_features':18s}: {self.n_features}")
@@ -428,78 +417,35 @@ class GalaxyXGBClassifier:
             features = self.scaler_X.transform(features)
         return features
 
-    def _evaluate(self, y_true, y_pred_proba, threshold=0.5):
-        """Compute the standard classification metrics plus a confusion matrix.
-
-        Args:
-            y_true: True labels, will be cast to int.
-            y_pred_proba: Positive-class probabilities in ``[0, 1]``.
-            threshold: Probability cut-off for the hard prediction.
-
-        Returns:
-            Dict with accuracy/precision/recall/f1/auc and the four
-            confusion-matrix counts (tp/fp/tn/fn).
-        """
-        y_pred = (y_pred_proba >= threshold).astype(int)
-        y_true_int = y_true.astype(int)
-
-        metrics = {
-            'accuracy': accuracy_score(y_true_int, y_pred),
-            'precision': precision_score(y_true_int, y_pred, zero_division=0),
-            'recall': recall_score(y_true_int, y_pred, zero_division=0),
-            'f1': f1_score(y_true_int, y_pred, zero_division=0),
-        }
-
-        # AUC is undefined when only one class is present; fall back to 0.
-        try:
-            metrics['auc'] = roc_auc_score(y_true_int, y_pred_proba)
-        except ValueError:
-            metrics['auc'] = 0.0
-
-        tn, fp, fn, tp = confusion_matrix(y_true_int, y_pred, labels=[0, 1]).ravel()
-        metrics['tp'] = tp
-        metrics['fp'] = fp
-        metrics['tn'] = tn
-        metrics['fn'] = fn
-
+    def _evaluate(self, y_true, y_pred):
+        """Delegate to :func:`cosmic.utils.evaluate_redshift_quality`."""
+        metrics = cu.evaluate_redshift_quality(y_pred, y_true)
         return metrics
 
     def _print_metrics_comparison(self, train_metrics, test_metrics):
-        """Print a side-by-side train/test metrics + confusion matrix table."""
-        print("\n" + "="*70)
-        print(f"{'Metric':<15} {'Trainset':<12} {'Testset':<12}")
-        print("="*70)
-        print(f"{'Accuracy':<15} {train_metrics['accuracy']:<12.6f} {test_metrics['accuracy']:<12.6f}")
-        print(f"{'Precision':<15} {train_metrics['precision']:<12.6f} {test_metrics['precision']:<12.6f}")
-        print(f"{'Recall':<15} {train_metrics['recall']:<12.6f} {test_metrics['recall']:<12.6f}")
-        print(f"{'F1 Score':<15} {train_metrics['f1']:<12.6f} {test_metrics['f1']:<12.6f}")
-        print(f"{'AUC-ROC':<15} {train_metrics['auc']:<12.6f} {test_metrics['auc']:<12.6f}")
-        print("-"*70)
-        print(f"{'TP':<15} {train_metrics['tp']:<12} {test_metrics['tp']:<12}")
-        print(f"{'FP':<15} {train_metrics['fp']:<12} {test_metrics['fp']:<12}")
-        print(f"{'TN':<15} {train_metrics['tn']:<12} {test_metrics['tn']:<12}")
-        print(f"{'FN':<15} {train_metrics['fn']:<12} {test_metrics['fn']:<12}")
-        print("="*70)
+        """Print a side-by-side table of train vs. test metrics."""
+        print("\n" + "="*60)
+        print(f"{'Metric':<20} {'Trainset':<12} {'Testset':<12}")
+        print("="*60)
+        print(f"{'<Δz_norm>':<20} {train_metrics['mean_bias']:<12.6f} {test_metrics['mean_bias']:<12.6f}")
+        print(f"{'std':<20} {train_metrics['std_dev']:<12.6f} {test_metrics['std_dev']:<12.6f}")
+        print(f"{'MAD':<20} {train_metrics['mad']:<12.6f} {test_metrics['mad']:<12.6f}")
+        print(f"{'outlier':<20} {train_metrics['outlier_fraction']:<12.6f} {test_metrics['outlier_fraction']:<12.6f}")
+        print("="*60)
 
     def _print_metrics_comparison_with_val(self, train_metrics, val_metrics, test_metrics):
         """Print metrics comparison including validation set."""
-        print("\n" + "="*90)
-        print(f"{'Metric':<15} {'Trainset':<15} {'Validation':<15} {'Testset':<15}")
-        print("="*90)
-        print(f"{'Accuracy':<15} {train_metrics['accuracy']:<15.6f} {val_metrics['accuracy']:<15.6f} {test_metrics['accuracy']:<15.6f}")
-        print(f"{'Precision':<15} {train_metrics['precision']:<15.6f} {val_metrics['precision']:<15.6f} {test_metrics['precision']:<15.6f}")
-        print(f"{'Recall':<15} {train_metrics['recall']:<15.6f} {val_metrics['recall']:<15.6f} {test_metrics['recall']:<15.6f}")
-        print(f"{'F1 Score':<15} {train_metrics['f1']:<15.6f} {val_metrics['f1']:<15.6f} {test_metrics['f1']:<15.6f}")
-        print(f"{'AUC-ROC':<15} {train_metrics['auc']:<15.6f} {val_metrics['auc']:<15.6f} {test_metrics['auc']:<15.6f}")
-        print("-"*90)
-        print(f"{'TP':<15} {train_metrics['tp']:<15} {val_metrics['tp']:<15} {test_metrics['tp']:<15}")
-        print(f"{'FP':<15} {train_metrics['fp']:<15} {val_metrics['fp']:<15} {test_metrics['fp']:<15}")
-        print(f"{'TN':<15} {train_metrics['tn']:<15} {val_metrics['tn']:<15} {test_metrics['tn']:<15}")
-        print(f"{'FN':<15} {train_metrics['fn']:<15} {val_metrics['fn']:<15} {test_metrics['fn']:<15}")
-        print("="*90)
+        print("\n" + "="*80)
+        print(f"{'Metric':<20} {'Trainset':<12} {'Validation':<12} {'Testset':<12}")
+        print("="*80)
+        print(f"{'<bias>':<20} {train_metrics['mean_bias']:<12.6f} {val_metrics['mean_bias']:<12.6f} {test_metrics['mean_bias']:<12.6f}")
+        print(f"{'std':<20} {train_metrics['std_dev']:<12.6f} {val_metrics['std_dev']:<12.6f} {test_metrics['std_dev']:<12.6f}")
+        print(f"{'MAD':<20} {train_metrics['mad']:<12.6f} {val_metrics['mad']:<12.6f} {test_metrics['mad']:<12.6f}")
+        print(f"{'outlier':<20} {train_metrics['outlier_fraction']:<12.6f} {val_metrics['outlier_fraction']:<12.6f} {test_metrics['outlier_fraction']:<12.6f}")
+        print("="*80)
 
     def fit(self):
-        """Fit the XGBoost classifier with early stopping.
+        """Fit the XGBoost model with early stopping.
 
         Uses the pre-loaded validation split when present, otherwise carves
         one out of the training set on the fly. Also persists the trained
@@ -507,11 +453,11 @@ class GalaxyXGBClassifier:
         ``config.save_model`` is ``True``.
         """
         X_train = self._get_features(self.train_df)
-        y_train = self.train_df[self.label_column].values
+        y_train = self.train_df['z'].values
 
         if self.val_df is not None:
             X_val = self._get_features(self.val_df)
-            y_val = self.val_df[self.label_column].values
+            y_val = self.val_df['z'].values
             print("Using pre-loaded validation set for early stopping...")
         else:
             # Fall back to a 20% holdout so early stopping still has an eval set.
@@ -534,36 +480,25 @@ class GalaxyXGBClassifier:
             self.config.save_to_yaml()
 
     def evaluate(self):
-        """Predict on every loaded split and report/plot/save metrics.
-
-        Populates ``{train,val,test}_pred_proba``, ``{train,val,test}_pred``
-        and ``{train,val,test}_metrics`` on ``self`` and attaches
-        ``pred_proba`` / ``pred`` columns to the stored DataFrames.
-        """
+        """Predict on every loaded split and report/plot/save metrics."""
         # Evaluate on training set
         X_train = self._get_features(self.train_df)
-        self.train_pred_proba = self.xgb_model.predict_proba(X_train)[:, 1]
-        self.train_pred = (self.train_pred_proba >= 0.5).astype(int)
-        self.train_df['pred_proba'] = self.train_pred_proba
-        self.train_df['pred'] = self.train_pred
-        self.train_metrics = self._evaluate(self.train_df[self.label_column].values, self.train_pred_proba)
+        self.train_pred = self.xgb_model.predict(X_train)
+        self.train_df['z_pred'] = self.train_pred
+        self.train_metrics = self._evaluate(self.train_df['z'].values, self.train_pred)
 
         # Evaluate on validation set if available
         if self.val_df is not None:
             X_val = self._get_features(self.val_df)
-            self.val_pred_proba = self.xgb_model.predict_proba(X_val)[:, 1]
-            self.val_pred = (self.val_pred_proba >= 0.5).astype(int)
-            self.val_df['pred_proba'] = self.val_pred_proba
-            self.val_df['pred'] = self.val_pred
-            self.val_metrics = self._evaluate(self.val_df[self.label_column].values, self.val_pred_proba)
+            self.val_pred = self.xgb_model.predict(X_val)
+            self.val_df['z_pred'] = self.val_pred
+            self.val_metrics = self._evaluate(self.val_df['z'].values, self.val_pred)
 
         # Evaluate on test set
         X_test = self._get_features(self.test_df)
-        self.test_pred_proba = self.xgb_model.predict_proba(X_test)[:, 1]
-        self.test_pred = (self.test_pred_proba >= 0.5).astype(int)
-        self.test_df['pred_proba'] = self.test_pred_proba
-        self.test_df['pred'] = self.test_pred
-        self.test_metrics = self._evaluate(self.test_df[self.label_column].values, self.test_pred_proba)
+        self.test_pred = self.xgb_model.predict(X_test)
+        self.test_df['z_pred'] = self.test_pred
+        self.test_metrics = self._evaluate(self.test_df['z'].values, self.test_pred)
 
         if self.val_df is not None:
             self._print_metrics_comparison_with_val(self.train_metrics, self.val_metrics, self.test_metrics)
@@ -577,77 +512,41 @@ class GalaxyXGBClassifier:
             self.save_results()
 
     def _plot_results(self):
-        """Render the four-panel classification summary figure.
+        """Save a two-panel hexbin of true vs. predicted redshift."""
+        plt.figure(figsize=(10, 5))
+        plt.subplot(121)
+        plt.plot([0, 1.], [0, 1.], color='gray', linestyle='--')
+        plt.hexbin(self.train_df['z'].values, self.train_pred,
+                   gridsize=100, bins='log', cmap='Blues', mincnt=1)
+        plt.xlabel('True Redshift')
+        plt.ylabel('Estimated Redshift')
+        plt.xlim(0, 1.)
+        plt.ylim(0, 1.)
+        plt.title('Training set')
+        text = f'<Δz_norm> = {self.train_metrics["mean_bias"]:.5f}\nstd = {self.train_metrics["std_dev"]:.5f}\nMAD = {self.train_metrics["mad"]:.5f}\noutliers = {self.train_metrics["outlier_fraction"]:.5f}'
+        plt.text(0.05, 0.95, text, transform=plt.gca().transAxes,
+                verticalalignment='top', horizontalalignment='left',
+                fontsize=12)
 
-        Panels are: train confusion matrix, test confusion matrix, train+test
-        ROC curves, and train probability distribution by true label.
-        """
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-
-        # Training set confusion matrix
-        ax = axes[0, 0]
-        cm_train = confusion_matrix(self.train_df[self.label_column].values.astype(int),
-                                    self.train_pred, labels=[0, 1])
-        im = ax.imshow(cm_train, interpolation='nearest', cmap=plt.cm.Blues)
-        ax.set_title('Training Set Confusion Matrix')
-        ax.set_xlabel('Predicted')
-        ax.set_ylabel('True')
-        ax.set_xticks([0, 1])
-        ax.set_yticks([0, 1])
-        ax.set_xticklabels(['Other (0)', 'Galaxy (1)'])
-        ax.set_yticklabels(['Other (0)', 'Galaxy (1)'])
-        for i in range(2):
-            for j in range(2):
-                ax.text(j, i, format(cm_train[i, j], 'd'),
-                       ha="center", va="center", color="white" if cm_train[i, j] > cm_train.max()/2 else "black")
-
-        # Test set confusion matrix
-        ax = axes[0, 1]
-        cm_test = confusion_matrix(self.test_df[self.label_column].values.astype(int),
-                                   self.test_pred, labels=[0, 1])
-        im = ax.imshow(cm_test, interpolation='nearest', cmap=plt.cm.Blues)
-        ax.set_title('Test Set Confusion Matrix')
-        ax.set_xlabel('Predicted')
-        ax.set_ylabel('True')
-        ax.set_xticks([0, 1])
-        ax.set_yticks([0, 1])
-        ax.set_xticklabels(['Other (0)', 'Galaxy (1)'])
-        ax.set_yticklabels(['Other (0)', 'Galaxy (1)'])
-        for i in range(2):
-            for j in range(2):
-                ax.text(j, i, format(cm_test[i, j], 'd'),
-                       ha="center", va="center", color="white" if cm_test[i, j] > cm_test.max()/2 else "black")
-
-        # ROC curves
-        ax = axes[1, 0]
-        fpr_train, tpr_train, _ = roc_curve(self.train_df[self.label_column].values.astype(int), self.train_pred_proba)
-        ax.plot(fpr_train, tpr_train, 'b-', label=f'Train (AUC = {self.train_metrics["auc"]:.4f})')
-        fpr_test, tpr_test, _ = roc_curve(self.test_df[self.label_column].values.astype(int), self.test_pred_proba)
-        ax.plot(fpr_test, tpr_test, 'r-', label=f'Test (AUC = {self.test_metrics["auc"]:.4f})')
-        ax.plot([0, 1], [0, 1], 'k--', label='Random')
-        ax.set_xlabel('False Positive Rate')
-        ax.set_ylabel('True Positive Rate')
-        ax.set_title('ROC Curve')
-        ax.legend(loc='lower right')
-        ax.grid(True)
-
-        # Probability distribution on the training set
-        ax = axes[1, 1]
-        ax.hist(self.train_pred_proba[self.train_df[self.label_column].values == 0], bins=50, alpha=0.5, label='Train Other (0)', color='blue')
-        ax.hist(self.train_pred_proba[self.train_df[self.label_column].values == 1], bins=50, alpha=0.5, label='Train Galaxy (1)', color='red')
-        ax.axvline(x=0.5, color='black', linestyle='--', label='Threshold (0.5)')
-        ax.set_xlabel('Predicted Probability')
-        ax.set_ylabel('Count')
-        ax.set_title('Probability Distribution (Training Set)')
-        ax.legend()
-
+        plt.subplot(122)
+        plt.plot([0, 1.], [0, 1.], color='gray', linestyle='--')
+        plt.hexbin(self.test_df['z'].values, self.test_pred,
+                   gridsize=100, bins='log', cmap='Blues', mincnt=1)
+        plt.xlabel('True Redshift')
+        plt.ylabel('Estimated Redshift')
+        plt.xlim(0, 1.)
+        plt.ylim(0, 1.)
+        plt.title('Test set')
+        text = f'<Δz_norm> = {self.test_metrics["mean_bias"]:.5f}\nstd = {self.test_metrics["std_dev"]:.5f}\nMAD = {self.test_metrics["mad"]:.5f}\noutliers = {self.test_metrics["outlier_fraction"]:.5f}'
+        plt.text(0.05, 0.95, text, transform=plt.gca().transAxes,
+                verticalalignment='top', horizontalalignment='left',
+                fontsize=12)
         plt.tight_layout()
 
         save_dir = self.config.get_save_dir()
         plot_path = save_dir / f'results.png'
         plt.savefig(plot_path, dpi=300)
         print(f"Results plot saved to: {plot_path}")
-        plt.close()
 
     def save_model(self):
         """Save the trained model to ``save_dir/xgb_model.json``."""
@@ -703,74 +602,68 @@ class GalaxyXGBClassifier:
         test_results_path = save_dir / "test_results.fits"
         cu.savefile(self.test_df, test_results_path)
 
-        # Companion files with only (label, pred, pred_proba) for quick reloads.
+        # Companion files with only (z, z_pred) for quick reloads.
         self._save_predictions()
 
         metrics_path = save_dir / "metrics.txt"
         with open(metrics_path, 'w') as f:
             f.write("Train Metrics:\n")
             for k, v in self.train_metrics.items():
-                if isinstance(v, float):
-                    f.write(f"  {k}: {v:.6f}\n")
-                else:
-                    f.write(f"  {k}: {v}\n")
+                f.write(f"  {k}: {v:.6f}\n")
 
             if hasattr(self, 'val_metrics'):
                 f.write("\nValidation Metrics:\n")
                 for k, v in self.val_metrics.items():
-                    if isinstance(v, float):
-                        f.write(f"  {k}: {v:.6f}\n")
-                    else:
-                        f.write(f"  {k}: {v}\n")
+                    f.write(f"  {k}: {v:.6f}\n")
 
             f.write("\nTest Metrics:\n")
             for k, v in self.test_metrics.items():
-                if isinstance(v, float):
-                    f.write(f"  {k}: {v:.6f}\n")
-                else:
-                    f.write(f"  {k}: {v}\n")
+                f.write(f"  {k}: {v:.6f}\n")
         print(f"Results saved to: {save_dir}")
 
     def _save_predictions(self):
-        """Save per-split prediction files with ``(label, pred, pred_proba)``."""
+        """Save per-split prediction files with ``(z, z_pred)``.
+
+        No ``z_err`` column is written because XGBoost does not provide a
+        cheap native uncertainty the way Random Forest does.
+        """
         save_dir = self.config.get_save_dir()
 
         train_pred_df = pd.DataFrame({
-            self.label_column: self.train_df[self.label_column].values,
-            'pred': self.train_pred,
-            'pred_proba': self.train_pred_proba
+            'z': self.train_df['z'].values,
+            'z_pred': self.train_pred
         })
         cu.savefile(train_pred_df, save_dir / "predictions_train.fits")
 
         if self.val_df is not None:
             val_pred_df = pd.DataFrame({
-                self.label_column: self.val_df[self.label_column].values,
-                'pred': self.val_pred,
-                'pred_proba': self.val_pred_proba
+                'z': self.val_df['z'].values,
+                'z_pred': self.val_pred
             })
             cu.savefile(val_pred_df, save_dir / "predictions_val.fits")
 
         test_pred_df = pd.DataFrame({
-            self.label_column: self.test_df[self.label_column].values,
-            'pred': self.test_pred,
-            'pred_proba': self.test_pred_proba
+            'z': self.test_df['z'].values,
+            'z_pred': self.test_pred
         })
         cu.savefile(test_pred_df, save_dir / "predictions_test.fits")
 
         print(f"Predictions saved to: {save_dir}/predictions_*.fits")
 
-    def predict(self, data_source, threshold=0.5):
-        """Predict galaxy (``1``) / non-galaxy (``0``) labels for new data.
+    def predict(self, data_source, return_uncertainty=False):
+        """Predict photometric redshifts for new data.
 
         Args:
             data_source: ``DataFrame``, file path, or numpy array of features.
                 A numpy array is assumed to already match ``features_names``
                 in order; it is passed through the scaler if one is active.
-            threshold: Probability cut-off for the hard prediction.
+            return_uncertainty: Placeholder. XGBoost does not expose a cheap
+                per-sample uncertainty; if ``True`` a NaN array is returned
+                and a warning is printed.
 
         Returns:
-            Tuple ``(predictions, probabilities)`` -- hard labels as int and
-            positive-class probabilities as float.
+            Tuple ``(phot_z, phot_z_err)``. ``phot_z_err`` is ``None`` when
+            ``return_uncertainty`` is ``False``, otherwise an array of NaNs.
 
         Raises:
             ValueError: If :meth:`fit` has not been called or
@@ -791,10 +684,14 @@ class GalaxyXGBClassifier:
         else:
             raise ValueError(f"Unsupported data_source type: {type(data_source)}")
 
-        probabilities = self.xgb_model.predict_proba(X_test)[:, 1]
-        predictions = (probabilities >= threshold).astype(int)
+        phot_z = self.xgb_model.predict(X_test)
+        phot_z_err = None
 
-        return predictions, probabilities
+        if return_uncertainty:
+            print("Warning: Uncertainty estimation for XGBoost is experimental")
+            phot_z_err = np.full(len(X_test), np.nan)
+
+        return phot_z, phot_z_err
 
     def get_feature_importance(self):
         """Return the XGBoost feature importances.
@@ -845,7 +742,7 @@ class GalaxyXGBClassifier:
         return importances, feature_names
 
     def plot_training_history(self):
-        """Plot the early-stopping validation log-loss curve, if available."""
+        """Plot the early-stopping validation RMSE curve, if available."""
         if not self.is_trained:
             print("Model not trained yet.")
             return
@@ -855,10 +752,10 @@ class GalaxyXGBClassifier:
             plt.figure(figsize=(10, 6))
 
             validation_0 = evals_result['validation_0']
-            if 'logloss' in validation_0:
-                plt.plot(validation_0['logloss'], label='Validation Log Loss')
+            if 'rmse' in validation_0:
+                plt.plot(validation_0['rmse'], label='Validation RMSE')
                 plt.xlabel('Boosting Round')
-                plt.ylabel('Log Loss')
+                plt.ylabel('RMSE')
                 plt.title('XGBoost Training History')
                 plt.legend()
                 plt.grid(True)
@@ -875,15 +772,15 @@ class GalaxyXGBClassifier:
 
 
 # ============================================================
-# Inference helper
+# Inference helper (similar to photoz_bin)
 # ============================================================
-class GalaxyXGBInference:
-    """Inference helper for trained XGBoost classification models.
+class PhotozXGBInference:
+    """Inference helper for trained XGBoost models.
 
     Loads a previously trained experiment (config, scaler, model) from a
-    directory written by :meth:`GalaxyXGBClassifier.fit` and exposes a
-    standalone :meth:`predict` without rebuilding a
-    :class:`GalaxyXGBClassifier` (no data load, no scaler fit).
+    directory written by :meth:`PhotozXGBoost.fit` and exposes a standalone
+    :meth:`predict` without rebuilding a :class:`PhotozXGBoost` (no data
+    load, no scaler fit).
     """
 
     def __init__(self, model_dir: str):
@@ -903,10 +800,8 @@ class GalaxyXGBInference:
         cfg_path = self.model_dir / 'config.yaml'
         if not cfg_path.exists():
             raise FileNotFoundError(f"Config file not found: {cfg_path}")
-        self.config = GalaxyXGBConfig()
+        self.config = PhotozXGBConfig()
         self.config.update_from_yaml(str(cfg_path))
-
-        self.label_column = self.config.dataset_params.get('label_column', 'label')
 
         scaler_path = self.model_dir / 'scaler.pkl'
         if scaler_path.exists():
@@ -917,7 +812,7 @@ class GalaxyXGBInference:
         model_path = self.model_dir / 'xgb_model.json'
         if not model_path.exists():
             raise FileNotFoundError(f"Model file not found: {model_path}")
-        self.xgb_model = xgb.XGBClassifier()
+        self.xgb_model = xgb.XGBRegressor()
         self.xgb_model.load_model(model_path)
 
         self.features_names = choose_features(
@@ -932,18 +827,19 @@ class GalaxyXGBInference:
             features = self.scaler_X.transform(features)
         return features
 
-    def predict(self, data_source, threshold=0.5):
-        """Predict galaxy (``1``) / non-galaxy (``0``) labels for new data.
+    def predict(self, data_source, return_uncertainty=False):
+        """Predict photometric redshifts for new data.
 
         Args:
             data_source: :class:`pandas.DataFrame` already containing the
                 catalog columns, or a path to a file readable by
                 :func:`load_datasets`.
-            threshold: Probability cut-off for the hard prediction.
+            return_uncertainty: Placeholder; see
+                :meth:`PhotozXGBoost.predict`.
 
         Returns:
-            Tuple ``(predictions, probabilities)`` -- hard labels as int and
-            positive-class probabilities as float.
+            Tuple ``(phot_z, phot_z_err)``. ``phot_z_err`` is ``None`` when
+            ``return_uncertainty`` is ``False``, otherwise an array of NaNs.
         """
         if isinstance(data_source, str):
             df = load_datasets(data_source)
@@ -951,10 +847,14 @@ class GalaxyXGBInference:
             df = data_source
 
         X_test = self._get_features(df)
-        probabilities = self.xgb_model.predict_proba(X_test)[:, 1]
-        predictions = (probabilities >= threshold).astype(int)
+        phot_z = self.xgb_model.predict(X_test)
 
-        return predictions, probabilities
+        phot_z_err = None
+        if return_uncertainty:
+            print("Warning: Uncertainty estimation for XGBoost is experimental")
+            phot_z_err = np.full(len(X_test), np.nan)
+
+        return phot_z, phot_z_err
 
 
 # ============================================================
@@ -962,13 +862,12 @@ class GalaxyXGBInference:
 # ============================================================
 if __name__ == '__main__':
     # Minimal end-to-end example using three pre-split FITS files.
-    # Replace the placeholder paths below with your own splits; the label
-    # column should contain galaxy=1, everything else=0.
-    config = GalaxyXGBConfig(
-        experiment_name="example_galaxy_clf",
+    # Replace the placeholder paths below with your own splits.
+    config = PhotozXGBConfig(
+        experiment_name="example_xgb",
         save_dir="./experiments",
         random_seed=42,
-        use_scaler=False,  # XGBoost handles un-scaled features natively.
+        use_scaler=True,
         dataset_mode={
             'type': 'files',
             'paths': {
@@ -977,32 +876,25 @@ if __name__ == '__main__':
                 'test': "/path/to/test.fits",
             }
         },
-        dataset_params={
-            'label_column': 'label',  # Column containing labels (galaxy=1, others=0)
-            # dataset_params otherwise defaults to PS1-style features
-            # (Kron/PSF/Ap mags + Kron/Ap colors). Supply ``feature_columns``
-            # instead for surveys whose catalogs use different column names,
-            # e.g.::
-            #     'feature_columns': ['dered_mag_g', 'dered_mag_r', ...]
-        },
+        # dataset_params defaults to PS1-style features (Kron/PSF/Ap mags +
+        # Kron/Ap colors). Supply ``feature_columns`` instead for surveys
+        # whose catalogs use different column names, e.g.::
+        #     dataset_params={'feature_columns': ['dered_mag_g', ...]}
         model_params={
-            'n_estimators': 500,
-            'max_depth': 12,
-            'learning_rate': 0.05,
+            'n_estimators': 300,
+            'max_depth': 10,
+            'learning_rate': 0.1,
             'subsample': 0.8,
             'colsample_bytree': 0.8,
             'min_child_weight': 1,
             'gamma': 0.0,
             'reg_alpha': 0.0,
             'reg_lambda': 1.0,
-            'objective': 'binary:logistic',
-            'eval_metric': 'logloss',
             'early_stopping_rounds': 50,
-            'scale_pos_weight': 1.0,  # Raise for class-imbalanced datasets.
         },
     )
 
-    xgb_model = GalaxyXGBClassifier(config=config)
+    xgb_model = PhotozXGBoost(config=config)
     xgb_model.fit()
     xgb_model.evaluate()
     xgb_model.plot_feature_importance()
@@ -1010,8 +902,8 @@ if __name__ == '__main__':
 
 
 # # Example 2: Using 'ratio' mode to split a single file
-# config = GalaxyXGBConfig(
-#     experiment_name="example_galaxy_clf_ratio",
+# config = PhotozXGBConfig(
+#     experiment_name="example_xgb_ratio",
 #     save_dir="./experiments",
 #     random_seed=42,
 #     use_scaler=True,
@@ -1021,7 +913,6 @@ if __name__ == '__main__':
 #         'ratios': {'train': 0.8, 'val': 0.1, 'test': 0.1}
 #     },
 #     dataset_params={
-#         'label_column': 'label',
 #         'feature_generation': {
 #             'mag_types': ['Kron', 'PSF', 'Ap'],
 #             'color_types': ['Kron', 'Ap'],
@@ -1035,13 +926,11 @@ if __name__ == '__main__':
 #         'max_depth': 8,
 #         'learning_rate': 0.1,
 #         'subsample': 0.8,
-#         'colsample_bytree': 0.8,
-#         'objective': 'binary:logistic',
-#         'eval_metric': 'logloss'
+#         'colsample_bytree': 0.8
 #     }
 # )
 #
-# xgb_model = GalaxyXGBClassifier(config=config)
+# xgb_model = PhotozXGBoost(config=config)
 # xgb_model.fit()
 # xgb_model.evaluate()
 # xgb_model.plot_feature_importance()
@@ -1049,5 +938,5 @@ if __name__ == '__main__':
 
 
 # # Example 3: Inference with a trained model
-# inference = GalaxyXGBInference(model_dir="/path/to/experiment_dir")
-# predictions, probabilities = inference.predict("/path/to/new_data.fits", threshold=0.5)
+# inference = PhotozXGBInference(model_dir="/path/to/experiment_dir")
+# phot_z, _ = inference.predict("/path/to/new_data.fits")
