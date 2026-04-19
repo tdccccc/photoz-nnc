@@ -1,0 +1,112 @@
+# Catalog pipeline configuration.
+#
+# Fill in the paths below with your local data/model locations before
+# running any stage. Variables use ${dotted.key} syntax resolved from
+# the root of this document (e.g. ${paths.catalog_base}/models).
+#
+# Override this file path with the PHOTOZ_CATALOG_CONFIG environment
+# variable or with `python -m catalog --config <path>`.
+
+# ---------------------------------------------------------------
+# Paths (fill in before running)
+# ---------------------------------------------------------------
+paths:
+  # Root directory holding models/, merge/, and publish/ outputs.
+  catalog_base: /path/to/photoz_catalog
+
+  # Photo-z models (one sub-directory per model: p1, p2, ..., p5).
+  # Each sub-directory must contain config.yaml, scaler.pkl,
+  # best_model.pkl, and TempScalingCalib/calibrator.pkl.
+  model_base: ${paths.catalog_base}/models
+
+  # Galaxy classifier model directories (contain config.yaml,
+  # scaler.pkl, best_model.pkl).
+  galaxy_clf_ls: ${paths.model_base}/galaxy_clf_ls
+  galaxy_clf_ps: ${paths.model_base}/galaxy_clf_ps
+
+  # Per-survey input/output directories for the prediction stage.
+  lsdr10:
+    input:  /path/to/lsdr10/input
+    output: /path/to/lsdr10/output
+  ps1dr2:
+    input:  /path/to/ps1dr2/input
+    output: /path/to/ps1dr2/output
+
+  # Intermediate 5-degree merge shards and final 30-degree publish
+  # volumes. Default to sub-directories of ${paths.catalog_base}.
+  merge:
+    main: ${paths.catalog_base}/merge/main
+    pdf:  ${paths.catalog_base}/merge/pdf
+  publish: ${paths.catalog_base}/publish
+
+# ---------------------------------------------------------------
+# File-name templates (fid = 0..n_ra_bins-1)
+# ---------------------------------------------------------------
+templates:
+  lsdr10_output: "lsdr10_{fid:02d}_photoz.h5"
+  ps1dr2_output: "ps1dr2_{fid:02d}_photoz.h5"
+  merge_main:    "RA{ra_start:03d}_{ra_end:03d}_main.fits"
+  merge_pdf:     "RA{ra_start:03d}_{ra_end:03d}_pdf.h5"
+  publish_main:  "catalog_main_RA{ra_start:03d}_{ra_end:03d}.fits.gz"
+  publish_pdf:   "catalog_pdf_RA{ra_start:03d}_{ra_end:03d}.h5"
+
+# ---------------------------------------------------------------
+# PDF quantization + RA binning
+# ---------------------------------------------------------------
+bins:
+  # Number of redshift bins in the published PDF and its z-range.
+  # Changing these breaks the on-disk format of existing outputs.
+  pdf_bins:  40
+  pdf_z_min: 0.0
+  pdf_z_max: 2.0
+
+  # Sky is split into n_ra_bins RA slices during prediction; merge
+  # groups them at merge_ra_step (deg) and publish regroups to
+  # publish_ra_step (deg).
+  n_ra_bins:        72
+  merge_ra_step:    5
+  publish_ra_step:  30
+
+# ---------------------------------------------------------------
+# Output columns
+# ---------------------------------------------------------------
+columns:
+  # Columns of the main FITS volume (uid must be first).
+  main:
+    - uid
+    - ra
+    - dec
+    - z_phot_mean
+    - z_phot_std
+    - z_phot_mode
+    - z_phot_median
+    - z_phot_l68
+    - z_phot_u68
+    - z_phot_l95
+    - z_phot_u95
+    - priority
+    - survey
+    - galaxy_prob
+
+  # Columns of the PDF HDF5 volume.
+  pdf:
+    - uid
+    - z_phot_pdf
+
+# ---------------------------------------------------------------
+# Runtime defaults (override as needed for your hardware)
+# ---------------------------------------------------------------
+runtime:
+  lsdr10:
+    devices:          ["cuda:0"]
+    batch_size:       32768
+    chunk_size:       200000
+    num_workers:      1
+    isolate_per_file: true
+
+  ps1dr2:
+    devices:          ["cuda:0"]
+    batch_size:       32768
+    chunk_size:       1000000
+    num_workers:      1
+    isolate_per_file: false
