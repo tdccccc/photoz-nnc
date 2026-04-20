@@ -1,11 +1,22 @@
-# nohup python3 photoz_lstm.py --config config.yaml &
+# Usage:
+#   python -m models.photoz.LSTM.photoz_lstm --config path/to/config.yaml
+#
+# Outputs land in {save_dir}/{experiment_name}/:
+#   config.yaml, scaler.pkl, best_model.pkl, checkpoint.pkl,
+#   training.log, metrics_curve.jpg, test_results.txt
+
+# ---------------------------------------------------------------
+# Experiment identity
+# ---------------------------------------------------------------
 experiment_name: "0LSTMwithUncertainty_addLayersUnits"
 random_seed: 2025
-gpu_id: '0'
+gpu_id: "0"
 save_dir: "."
 
-# Model configuration
-model_class_name: 'DeepPhotozLSTMWithUncertainty'  # 'DeepPhotozLSTMWithUncertainty'
+# ---------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------
+model_class_name: "DeepPhotozLSTMWithUncertainty"
 model_params:
   input_dim: 38
   lstm_hidden_size: 32
@@ -13,71 +24,87 @@ model_params:
   fc_hidden_dims: [1024, 512, 256]
   dropout_rate: 0.2
   use_batch_norm: true
-  output_activation: 'relu'
+  output_activation: "relu"
 
-# Dataset configuration
-dataset_class_name: 'Dataset_Photz'
+# ---------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------
+dataset_class_name: "Dataset_Photz"
 dataset_params:
-  # file_path: "/home/tiandc/panstarrs/panstarrs_desi/data/ps1dr2_loc_xDESIDR1_xSDSSDR18_phot_clean_train.fits"
-  mag_types: ['Kron', 'PSF', 'Ap']
-  color_types: ['Kron', 'Ap']
+  # Feature layout for PS1-style catalogs.
+  # Colors are added first, followed by magnitudes and then error columns.
+  mag_types: ["Kron", "PSF", "Ap"]
+  color_types: ["Kron", "Ap"]
   use_mag: true
   use_magerr: true
   use_colorerr: false
   label_noise: 0.0
 
 dataset_mode:
-  # type: 'ratio'
+  # Use one file for all rows and split by ratios:
+  # type: "ratio"
   # ratios:
   #   train: 0.8
   #   val: 0.1
   #   test: 0.1
-  type: 'files'
+  type: "files"
   paths:
-    train: "/home/tiandc/panstarrs/panstarrs_desi/data/ps1dr2_loc_xDESIDR1_xSDSSDR18_phot_clean_train.fits"
-    val: "/home/tiandc/panstarrs/panstarrs_desi/data/ps1dr2_loc_xDESIDR1_xSDSSDR18_phot_clean_val.fits"
-    test: "/home/tiandc/panstarrs/panstarrs_desi/data/ps1dr2_loc_xDESIDR1_xSDSSDR18_phot_clean_test.fits"
+    train: "/path/to/train.fits"
+    val: "/path/to/val.fits"
+    test: "/path/to/test.fits"
 
+# ---------------------------------------------------------------
+# Label transform
+# ---------------------------------------------------------------
+# Uncomment one transform block if the model should train on a transformed
+# redshift target instead of the raw ``z`` value.
+#
 # label_transform: "none"
-# Label transformation configuration (choose one)
-# Option 1: log1p transformation (recommended for redshift starting from 0)
-# label_transform: "log1p"  # log(1 + z)
+#
+# Option 1: log1p transform, suitable for non-negative redshifts.
+# label_transform: "log1p"
 # label_transform_params: {}
-
-# Option 2: log transformation with offset
+#
+# Option 2: log transform with a configurable offset.
 # label_transform: "log"
 # label_transform_params:
-#   offset: 1.  # log(z + offset)
-
-# Option 3: square root transformation
+#   offset: 1.0
+#
+# Option 3: square-root transform.
 label_transform: "sqrt"
 label_transform_params: {}
-
-# Option 4: power transformation
+#
+# Option 4: power transform.
 # label_transform: "power"
 # label_transform_params:
-#   power: 0.5  # z^0.5
-
-# Option 5: asinh transformation (handles negative values)
+#   power: 0.5
+#
+# Option 5: asinh transform.
 # label_transform: "asinh"
 # label_transform_params:
 #   scale: 1.0
 
-# Training configuration
+# ---------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------
 batch_size: 4096
 epochs: 300
 early_stopping: 20
-loss_type: "gaussian_nll"  # "gaussian_nll","mse","huber"
+loss_type: "gaussian_nll"  # gaussian_nll | mse | huber
 train_augmentation: false
 
-# Optimizer configuration
+# ---------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------
 optimizer_config:
   name: "AdamW"
   params:
     lr: 0.0005
     weight_decay: 0.001
 
-# Scheduler configuration
+# ---------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------
 scheduler_config:
   name: "ReduceLROnPlateau"
   params:
@@ -86,8 +113,10 @@ scheduler_config:
     patience: 5
     verbose: true
 
+# ---------------------------------------------------------------
 # Gradient clipping
+# ---------------------------------------------------------------
 gradient_clipping:
   enabled: true
-  method: 'norm'
+  method: "norm"
   max_norm: 1.0

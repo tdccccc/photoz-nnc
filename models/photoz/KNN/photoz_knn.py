@@ -16,7 +16,7 @@ Optional backends:
 
 * FAISS (``use_faiss=True``) replaces sklearn's index for euclidean/weighted
   distance, which is materially faster on large training sets.
-* A C++ extension (``cosmic.cpp_chi_square_distance``) replaces the numpy
+* A C++ extension (``lib.cpp_ext.cpp_chi_square_distance``) replaces the numpy
   broadcast loop for the chi-square path when available.
 
 Typical workflow:
@@ -49,12 +49,11 @@ from sklearn.neighbors import NearestNeighbors
 
 import joblib
 
-# External utils (same as photoz_ann.py)
-import cosmic.utils as cu
+from lib.io import readfile
 
 # Try to import C++ chi-square distance function
 try:
-    from cosmic import cpp_chi_square_distance
+    from lib.cpp_ext import cpp_chi_square_distance
     HAS_CPP_CHI_SQUARE = True
 except ImportError:
     HAS_CPP_CHI_SQUARE = False
@@ -157,7 +156,7 @@ class DatasetPhotozKNN:
         Args:
             dataset: Pre-loaded DataFrame. Mutually exclusive with
                 ``file_path``.
-            file_path: Path to a file readable by :func:`cosmic.utils.readfile`.
+            file_path: Path to a file readable by :func:`lib.io.readfile`.
                 Mutually exclusive with ``dataset``.
             color_feature_columns: Required list of color column names, e.g.
                 ``['Kron_gr', 'Kron_ri', ...]``.
@@ -188,7 +187,7 @@ class DatasetPhotozKNN:
         if file_path is not None:
             if not os.path.exists(file_path):
                 raise FileNotFoundError(f"Data file not found: {file_path}")
-            self.dataset = cu.readfile(file_path)
+            self.dataset = readfile(file_path)
         else:
             self.dataset = dataset
 
@@ -855,7 +854,7 @@ class KNNTrainer:
                 raise ValueError("When using 'files' mode, all paths (train, val, test) must be specified")
             self._create_datasets_from_paths(paths)
         elif mode_type == 'ratio':
-            dataset = cu.readfile(self.config.dataset_params.get('file_path'))
+            dataset = readfile(self.config.dataset_params.get('file_path'))
             total = len(dataset)
             indices = list(range(total))
             ratios = self.config.dataset_mode.get('ratios', {'train': 0.8, 'val': 0.1, 'test': 0.1})

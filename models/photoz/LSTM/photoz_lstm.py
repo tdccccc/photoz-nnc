@@ -1,6 +1,23 @@
-#============================================================
+"""LSTM-based photo-z training and inference.
+
+This script defines the configuration, dataset, model architectures,
+training loop, and inference utilities for recurrent photo-z regression.
+It supports both plain point-estimation models and uncertainty-aware
+variants that predict a mean redshift together with a scale parameter.
+
+The workflow includes:
+
+* reading YAML configuration files;
+* building PS1-style feature vectors from catalog tables;
+* training feed-forward or LSTM-based regression models;
+* evaluating validation and test metrics during training;
+* saving model checkpoints, plots, and the fitted scaler;
+* loading trained runs for deterministic or MC-dropout inference.
+"""
+
+# ============================================================
 # Import
-#============================================================
+# ============================================================
 import os
 import time
 import logging
@@ -24,14 +41,16 @@ from torch.optim.lr_scheduler import _LRScheduler
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
-import cosmic.utils as cu
 import joblib
+from lib.io import readfile
 
-#============================================================
+
+# ============================================================
 # Config
-#============================================================
+# ============================================================
 @dataclass
 class Config:
+    """Training and inference configuration loaded from YAML."""
     # Experiment setup
     config_path: str = "config.yaml"
     save_dir: str = "."
@@ -86,12 +105,12 @@ class Config:
                 setattr(self, key, value)
 
 
-
-#============================================================
+# ============================================================
 # Dataset
-#============================================================
+# ============================================================
 class Dataset_Photz(Dataset):
-    
+    """Catalog-to-tensor dataset for LSTM-style photo-z regression."""
+
     def __init__(self, 
                  dataset: pd.DataFrame = None,
                  file_path: str = None, 
@@ -128,7 +147,7 @@ class Dataset_Photz(Dataset):
         if file_path is not None:
             if not os.path.exists(file_path):
                 raise FileNotFoundError(f"Data file not found: {file_path}")
-            self.dataset = cu.readfile(file_path)
+            self.dataset = readfile(file_path)
         else:
             self.dataset = dataset
     
@@ -161,7 +180,7 @@ class Dataset_Photz(Dataset):
         mag_cols = []
         err_cols = []
         
-        # Add color features using color_types
+        # Add color features first so related errors stay grouped.
         if color_types:
             for color_type in color_types:
                 for colour in colours:
@@ -169,7 +188,7 @@ class Dataset_Photz(Dataset):
                     if use_colorerr:
                         err_cols.extend([f'{color_type}_{colour}_Err'])
         
-        # Add magnitude features using mag_types
+        # Add magnitude features and then append their error columns.
         if use_mag and mag_types:
             for band in bands:
                 for mag_type in mag_types:
@@ -185,21 +204,21 @@ class Dataset_Photz(Dataset):
         if self.label_transform == 'none':
             return labels
         elif self.label_transform == 'log1p':
-            # log(1 + x) transformation - good for values starting from 0
+            # Apply log(1 + z) for non-negative targets.
             return np.log1p(labels)
         elif self.label_transform == 'log':
-            # log(x + offset) transformation
+            # Apply a shifted log transform.
             offset = self.label_transform_params.get('offset', 1e-8)
             return np.log(labels + offset)
         elif self.label_transform == 'sqrt':
-            # sqrt(x) transformation - preserves order, compresses large values
-            return np.sqrt(np.maximum(labels, 0))  # Ensure non-negative input
+            # Compress the dynamic range while keeping the target ordered.
+            return np.sqrt(np.maximum(labels, 0))
         elif self.label_transform == 'power':
-            # x^power transformation
+            # Apply a configurable power transform.
             power = self.label_transform_params.get('power', 0.5)
             return np.power(np.maximum(labels, 0), power)
         elif self.label_transform == 'asinh':
-            # inverse hyperbolic sine - handles negative values well
+            # Apply asinh with a configurable scale factor.
             scale = self.label_transform_params.get('scale', 1.0)
             return np.arcsinh(labels / scale)
         else:
@@ -216,7 +235,7 @@ class Dataset_Photz(Dataset):
         if transform_type == 'none':
             return transformed_labels
         elif transform_type == 'log1p':
-            return np.expm1(transformed_labels)  # exp(x) - 1
+            return np.expm1(transformed_labels)
         elif transform_type == 'log':
             offset = transform_params.get('offset', 1e-8)
             return np.exp(transformed_labels) - offset
@@ -242,10 +261,9 @@ class Dataset_Photz(Dataset):
         elif self.mode == 'inference':
             return {'input': features}
 
-
-#============================================================
+# ============================================================
 # Model
-#============================================================
+# ============================================================
 ACTIVATION_FUNCTIONS = {
     'relu': nn.ReLU,
     'gelu': nn.GELU,
@@ -258,6 +276,7 @@ ACTIVATION_FUNCTIONS = {
 }
 
 class DeepPhotozNet(nn.Module):
+    """Residual MLP regressor for photo-z point estimation."""
     
     def __init__(self, 
                  input_dim: int, 
@@ -290,47 +309,41 @@ class DeepPhotozNet(nn.Module):
         self.dropout_rate = dropout_rate
         self.output_activation = output_activation
         
-        # 获取激活函数
+        # Resolve the hidden-layer activation function.
         if activation_function not in ACTIVATION_FUNCTIONS:
             raise ValueError(f"Unsupported activation function: {activation_function}. "
                            f"Available: {list(ACTIVATION_FUNCTIONS.keys())}")
         
         activation_fn = ACTIVATION_FUNCTIONS[activation_function]
         
-        # 检查归一化方法冲突
+        # Prefer BatchNorm when both normalization modes are requested.
         if use_batch_norm and use_layer_norm:
             logging.warning("Both BatchNorm and LayerNorm are enabled. Using BatchNorm only.")
             use_layer_norm = False
         
-        # 构建网络层
+        # Build the hidden blocks and their optional residual projections.
         self.layers = nn.ModuleList()
         self.residual_layers = nn.ModuleList()
         
         in_dim = input_dim
         
         for i, hidden_dim in enumerate(hidden_dims):
-            # 创建主要的特征层
             layer_components = []
             
-            # 线性层
             layer_components.append(nn.Linear(in_dim, hidden_dim))
             
-            # 归一化层
             if use_batch_norm:
                 layer_components.append(nn.BatchNorm1d(hidden_dim))
             elif use_layer_norm:
                 layer_components.append(nn.LayerNorm(hidden_dim))
             
-            # 激活函数
             layer_components.append(activation_fn())
             
-            # Dropout
             if dropout_rate > 0:
                 layer_components.append(nn.Dropout(dropout_rate))
             
             self.layers.append(nn.Sequential(*layer_components))
             
-            # 残差连接层
             if use_residual:
                 if in_dim == hidden_dim:
                     self.residual_layers.append(nn.Identity())
@@ -341,10 +354,10 @@ class DeepPhotozNet(nn.Module):
             
             in_dim = hidden_dim
         
-        # 输出层
+        # Map the final hidden state to a single scalar prediction.
         self.output_layer = nn.Linear(in_dim, 1)
         
-        # 输出激活函数
+        # Apply an optional activation at the output.
         if output_activation == 'none':
             self.output_act = nn.Identity()
         elif output_activation in ACTIVATION_FUNCTIONS:
@@ -354,7 +367,7 @@ class DeepPhotozNet(nn.Module):
             raise ValueError(f"Unsupported output activation function: {output_activation}. "
                            f"Available: {available_functions}")
         
-        # 权重初始化
+        # Initialize all trainable parameters once after construction.
         self._initialize_weights()
         
     def _initialize_weights(self):
@@ -376,10 +389,8 @@ class DeepPhotozNet(nn.Module):
         for layer, residual_layer in zip(self.layers, self.residual_layers):
             identity = x
             
-            # 主路径
             out = layer(x)
             
-            # 残差连接
             if self.use_residual and residual_layer is not None:
                 if isinstance(residual_layer, nn.Identity):
                     out = out + identity
@@ -388,11 +399,11 @@ class DeepPhotozNet(nn.Module):
             
             x = out
         
-        # 输出层
         return self.output_act(self.output_layer(x))
     
     
 class DeepPhotozLSTM(nn.Module):
+    """Bidirectional LSTM regressor with a fully connected prediction head."""
     
     def __init__(self, 
                  input_dim: int, 
@@ -426,12 +437,12 @@ class DeepPhotozLSTM(nn.Module):
         self.use_batch_norm = use_batch_norm
         self.output_activation = output_activation
         
-        # LSTM layers (bidirectional)
+        # Stack bidirectional LSTM blocks over the feature sequence.
         self.lstm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
         self.batch_norm_layers = nn.ModuleList()
         
-        # First LSTM layer
+        # The first block reads one feature value per time step.
         self.lstm_layers.append(
             nn.LSTM(input_size=1, hidden_size=lstm_hidden_size, 
                    batch_first=True, bidirectional=True)
@@ -440,7 +451,7 @@ class DeepPhotozLSTM(nn.Module):
         if use_batch_norm:
             self.batch_norm_layers.append(nn.BatchNorm1d(lstm_hidden_size * 2))
         
-        # Additional LSTM layers
+        # Later blocks consume the bidirectional hidden representation.
         for i in range(1, num_lstm_layers):
             self.lstm_layers.append(
                 nn.LSTM(input_size=lstm_hidden_size * 2, hidden_size=lstm_hidden_size,
@@ -450,9 +461,9 @@ class DeepPhotozLSTM(nn.Module):
             if use_batch_norm:
                 self.batch_norm_layers.append(nn.BatchNorm1d(lstm_hidden_size * 2))
         
-        # Fully connected layers
+        # Follow the recurrent stack with a standard MLP head.
         self.fc_layers = nn.ModuleList()
-        in_features = lstm_hidden_size * 2  # bidirectional output
+        in_features = lstm_hidden_size * 2
         
         for hidden_dim in fc_hidden_dims:
             self.fc_layers.append(nn.Linear(in_features, hidden_dim))
@@ -463,10 +474,10 @@ class DeepPhotozLSTM(nn.Module):
                 self.fc_layers.append(nn.Dropout(dropout_rate))
             in_features = hidden_dim
         
-        # Output layer
+        # Predict a single redshift value from the pooled sequence state.
         self.output_layer = nn.Linear(in_features, 1)
         
-        # Output activation function
+        # Apply an optional activation at the output.
         if output_activation == 'none':
             self.output_act = nn.Identity()
         elif output_activation in ACTIVATION_FUNCTIONS:
@@ -476,7 +487,7 @@ class DeepPhotozLSTM(nn.Module):
             raise ValueError(f"Unsupported output activation function: {output_activation}. "
                            f"Available: {available_functions}")
         
-        # Initialize weights
+        # Initialize all trainable parameters once after construction.
         self._initialize_weights()
         
     def _initialize_weights(self):
@@ -500,20 +511,17 @@ class DeepPhotozLSTM(nn.Module):
         """Forward pass."""
         batch_size = x.size(0)
         
-        # Reshape input for LSTM: (batch, seq_len, input_size)
-        # Each feature is treated as a time step
-        x = x.unsqueeze(-1)  # (batch, features, 1)
+        # Treat each input feature as one step in the recurrent sequence.
+        x = x.unsqueeze(-1)
         
-        # Process through LSTM layers
+        # Run the sequence through the stacked LSTM blocks.
         for i, (lstm_layer, dropout_layer) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
-            lstm_out, _ = lstm_layer(x)  # (batch, seq_len, hidden_size * 2)
+            lstm_out, _ = lstm_layer(x)
             
-            # Apply dropout
             lstm_out = dropout_layer(lstm_out)
             
-            # Apply batch normalization if enabled
+            # Normalize per-step hidden states when requested.
             if self.use_batch_norm and i < len(self.batch_norm_layers):
-                # Reshape for batch norm: (batch * seq_len, features)
                 seq_len = lstm_out.size(1)
                 lstm_out = lstm_out.contiguous().view(-1, lstm_out.size(-1))
                 lstm_out = self.batch_norm_layers[i](lstm_out)
@@ -521,20 +529,18 @@ class DeepPhotozLSTM(nn.Module):
             
             x = lstm_out
         
-        # Use the last time step output (or mean pooling)
-        # Here we use mean pooling across the sequence dimension
-        x = torch.mean(x, dim=1)  # (batch, hidden_size * 2)
+        # Pool over the sequence dimension before the MLP head.
+        x = torch.mean(x, dim=1)
         
-        # Process through fully connected layers
         for layer in self.fc_layers:
             x = layer(x)
         
-        # Output layer
         x = self.output_layer(x)
         return self.output_act(x)
 
 
 class DeepPhotozLSTMWithUncertainty(nn.Module):
+    """Bidirectional LSTM regressor that predicts both mean and scale."""
     
     def __init__(self, 
                  input_dim: int, 
@@ -567,12 +573,12 @@ class DeepPhotozLSTMWithUncertainty(nn.Module):
         self.dropout_rate = dropout_rate
         self.use_batch_norm = use_batch_norm
         
-        # LSTM layers (bidirectional)
+        # Stack bidirectional LSTM blocks over the feature sequence.
         self.lstm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
         self.batch_norm_layers = nn.ModuleList()
         
-        # First LSTM layer
+        # The first block reads one feature value per time step.
         self.lstm_layers.append(
             nn.LSTM(input_size=1, hidden_size=lstm_hidden_size, 
                    batch_first=True, bidirectional=True)
@@ -581,7 +587,7 @@ class DeepPhotozLSTMWithUncertainty(nn.Module):
         if use_batch_norm:
             self.batch_norm_layers.append(nn.BatchNorm1d(lstm_hidden_size * 2))
         
-        # Additional LSTM layers
+        # Later blocks consume the bidirectional hidden representation.
         for i in range(1, num_lstm_layers):
             self.lstm_layers.append(
                 nn.LSTM(input_size=lstm_hidden_size * 2, hidden_size=lstm_hidden_size,
@@ -591,9 +597,9 @@ class DeepPhotozLSTMWithUncertainty(nn.Module):
             if use_batch_norm:
                 self.batch_norm_layers.append(nn.BatchNorm1d(lstm_hidden_size * 2))
         
-        # Shared backbone fully connected layers
+        # Use a shared MLP backbone before branching into two heads.
         self.fc_layers = nn.ModuleList()
-        in_features = lstm_hidden_size * 2  # bidirectional output
+        in_features = lstm_hidden_size * 2
         
         for hidden_dim in fc_hidden_dims:
             self.fc_layers.append(nn.Linear(in_features, hidden_dim))
@@ -604,14 +610,14 @@ class DeepPhotozLSTMWithUncertainty(nn.Module):
                 self.fc_layers.append(nn.Dropout(dropout_rate))
             in_features = hidden_dim
         
-        # Output heads
+        # Predict the mean and a positive scale parameter.
         self.mu_head = nn.Linear(in_features, 1)
         self.sigma_head = nn.Linear(in_features, 1)
         
-        # Activation for sigma (ensure positive values)
+        # Force the scale prediction to stay positive.
         self.softplus = nn.Softplus()
         
-        # Activation for mu
+        # Apply an optional activation to the mean head.
         if output_activation == 'none':
             self.mu_act = nn.Identity()
         elif output_activation in ACTIVATION_FUNCTIONS:
@@ -621,7 +627,7 @@ class DeepPhotozLSTMWithUncertainty(nn.Module):
             raise ValueError(f"Unsupported output activation function for mu: {output_activation}. "
                            f"Available: {available_functions}")
         
-        # Initialize weights
+        # Initialize all trainable parameters once after construction.
         self._initialize_weights()
         
     def _initialize_weights(self):
@@ -645,20 +651,17 @@ class DeepPhotozLSTMWithUncertainty(nn.Module):
         """Forward pass."""
         batch_size = x.size(0)
         
-        # Reshape input for LSTM: (batch, seq_len, input_size)
-        # Each feature is treated as a time step
-        x = x.unsqueeze(-1)  # (batch, features, 1)
+        # Treat each input feature as one step in the recurrent sequence.
+        x = x.unsqueeze(-1)
         
-        # Process through LSTM layers
+        # Run the sequence through the stacked LSTM blocks.
         for i, (lstm_layer, dropout_layer) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
-            lstm_out, _ = lstm_layer(x)  # (batch, seq_len, hidden_size * 2)
+            lstm_out, _ = lstm_layer(x)
             
-            # Apply dropout
             lstm_out = dropout_layer(lstm_out)
             
-            # Apply batch normalization if enabled
+            # Normalize per-step hidden states when requested.
             if self.use_batch_norm and i < len(self.batch_norm_layers):
-                # Reshape for batch norm: (batch * seq_len, features)
                 seq_len = lstm_out.size(1)
                 lstm_out = lstm_out.contiguous().view(-1, lstm_out.size(-1))
                 lstm_out = self.batch_norm_layers[i](lstm_out)
@@ -666,14 +669,12 @@ class DeepPhotozLSTMWithUncertainty(nn.Module):
             
             x = lstm_out
         
-        # Use mean pooling across the sequence dimension
-        x = torch.mean(x, dim=1)  # (batch, hidden_size * 2)
+        # Pool over the sequence dimension before the MLP head.
+        x = torch.mean(x, dim=1)
         
-        # Process through shared fully connected layers
         for layer in self.fc_layers:
             x = layer(x)
         
-        # Calculate mu and sigma
         mu = self.mu_act(self.mu_head(x))
         sigma = self.softplus(self.sigma_head(x)) + 1e-6
         
@@ -681,6 +682,7 @@ class DeepPhotozLSTMWithUncertainty(nn.Module):
 
 
 class DeepPhotozNetWithUncertainty(nn.Module):
+    """Residual MLP regressor that predicts both mean and scale."""
     
     def __init__(self, 
                  input_dim: int, 
@@ -712,19 +714,19 @@ class DeepPhotozNetWithUncertainty(nn.Module):
         self.use_residual = use_residual
         self.dropout_rate = dropout_rate
         
-        # Get activation function
+        # Resolve the hidden-layer activation function.
         if activation_function not in ACTIVATION_FUNCTIONS:
             raise ValueError(f"Unsupported activation function: {activation_function}. "
                            f"Available: {list(ACTIVATION_FUNCTIONS.keys())}")
         
         activation_fn = ACTIVATION_FUNCTIONS[activation_function]
         
-        # Check for normalization conflict
+        # Prefer BatchNorm when both normalization modes are requested.
         if use_batch_norm and use_layer_norm:
             logging.warning("Both BatchNorm and LayerNorm are enabled. Using BatchNorm only.")
             use_layer_norm = False
         
-        # Backbone layers
+        # Build the hidden blocks and their optional residual projections.
         self.layers = nn.ModuleList()
         self.residual_layers = nn.ModuleList()
         
@@ -756,14 +758,14 @@ class DeepPhotozNetWithUncertainty(nn.Module):
             
             in_dim = hidden_dim
         
-        # Output heads
+        # Predict the mean and a positive scale parameter.
         self.mu_head = nn.Linear(in_dim, 1)
         self.sigma_head = nn.Linear(in_dim, 1)
         
-        # Activation for sigma
+        # Force the scale prediction to stay positive.
         self.softplus = nn.Softplus()
 
-        # Activation for mu
+        # Apply an optional activation to the mean head.
         if output_activation == 'none':
             self.mu_act = nn.Identity()
         elif output_activation in ACTIVATION_FUNCTIONS:
@@ -773,7 +775,7 @@ class DeepPhotozNetWithUncertainty(nn.Module):
             raise ValueError(f"Unsupported output activation function for mu: {output_activation}. "
                            f"Available: {available_functions}")
         
-        # Initialize weights
+        # Initialize all trainable parameters once after construction.
         self._initialize_weights()
         
     def _initialize_weights(self):
@@ -805,16 +807,14 @@ class DeepPhotozNetWithUncertainty(nn.Module):
             
             x = out
         
-        # Calculate mu and sigma
         mu = self.mu_act(self.mu_head(x))
         sigma = self.softplus(self.sigma_head(x)) + 1e-6
         
         return mu, sigma
 
-
-#============================================================
+# ============================================================
 # Optimizer and Scheduler
-#============================================================
+# ============================================================
 def get_optimizer(parameters: Iterable[torch.nn.Parameter], 
                   config: Dict[str, Any]
     ) -> optim.Optimizer:
@@ -840,7 +840,7 @@ def get_scheduler(optimizer: optim.Optimizer,
     scheduler_name = config["name"]
     params = config.get("params", {})
     
-    # Special handling for schedulers that need context from the trainer
+    # Infer scheduler arguments that depend on the training setup.
     if training_context:
         if scheduler_name == 'CosineAnnealingLR' and 'T_max' not in params:
             params['T_max'] = training_context.get('epochs')
@@ -852,11 +852,11 @@ def get_scheduler(optimizer: optim.Optimizer,
 
     return scheduler_cls(optimizer, **params) 
 
-
-#============================================================
+# ============================================================
 # Utils
-#============================================================
+# ============================================================
 class EarlyStopping:
+    """Stop training after the validation loss stops improving."""
     
     def __init__(self, 
                  patience: int,
@@ -916,6 +916,7 @@ class EarlyStopping:
 
 
 class RegressionLoss:
+    """Factory and custom loss modules for regression training."""
     
     @staticmethod
     def get_loss_fn(loss_type: str) -> Callable:
@@ -926,19 +927,14 @@ class RegressionLoss:
         elif loss_type == 'huber':
             return nn.HuberLoss()
         elif loss_type == 'log_mse':
-            # Log-transformed MSE for positive values
             return RegressionLoss.LogMSELoss()
         elif loss_type == 'log_mae':
-            # Log-transformed MAE for positive values  
             return RegressionLoss.LogMAELoss()
         elif loss_type == 'relative_mse':
-            # Relative MSE: (pred - true)^2 / true^2
             return RegressionLoss.RelativeMSELoss()
         elif loss_type == 'relative_mae':
-            # Relative MAE: |pred - true| / true
             return RegressionLoss.RelativeMAELoss()
         elif loss_type == 'log_cosh':
-            # Log-cosh loss for positive values
             return RegressionLoss.LogCoshLoss()
         elif loss_type == 'gaussian_nll':
             return nn.GaussianNLLLoss()
@@ -952,7 +948,6 @@ class RegressionLoss:
             self.epsilon = epsilon
             
         def forward(self, pred: Tensor, true: Tensor) -> Tensor:
-            # Add small epsilon to avoid log(0)
             pred_log = torch.log(torch.clamp(pred, min=self.epsilon) + 1)
             true_log = torch.log(torch.clamp(true, min=self.epsilon) + 1)
             return nn.functional.mse_loss(pred_log, true_log)
@@ -1009,11 +1004,11 @@ def calculate_metrics(labels, predictions, running_loss, num_batches):
     } 
 
 
-
-#============================================================
+# ============================================================
 # Trainer
-#============================================================
+# ============================================================
 class Trainer:
+    """End-to-end trainer for the LSTM photo-z models."""
     
     def __init__(self, config: Config):
         self.config = config
@@ -1065,7 +1060,7 @@ class Trainer:
             logging.info(f"{key}: {value}")
         logging.info("---------------------\n")
         
-        # Save the config file for reproducibility
+        # Save the effective config next to the training outputs.
         with open(self.logdir / 'config.yaml', 'w') as f:
             yaml.dump(asdict(self.config), f, default_flow_style=False, sort_keys=False)
 
@@ -1078,14 +1073,14 @@ class Trainer:
         mode_type = self.config.dataset_mode.get('type', 'ratio')
         
         if mode_type == 'files':
-            # Load datasets directly from file paths
+            # Load train, validation, and test catalogs from explicit paths.
             paths = self.config.dataset_mode.get('paths', {})
             if not all(paths.get(split) for split in ['train', 'val', 'test']):
                 raise ValueError("When using 'files' mode, all paths (train, val, test) must be specified")
                 
             logging.info("Loading datasets from specified file paths...")
             
-            # Create training dataset without scaling to fit scaler
+            # Build an unscaled training dataset to fit the feature scaler.
             temp_train_dataset = Dataset_Photz(
                 file_path=paths['train'],
                 mag_types=self.config.dataset_params.get('mag_types'),
@@ -1100,11 +1095,11 @@ class Trainer:
                 label_transform_params=self.config.label_transform_params
             )
             
-            # Fit scaler on training data
+            # Fit the scaler on training features only.
             scaler_X = StandardScaler()
             scaler_X.fit(temp_train_dataset.features)
             
-            # Create all datasets with the fitted scaler
+            # Recreate all splits with the fitted scaler attached.
             train_dataset = Dataset_Photz(
                 file_path=paths['train'],
                 mag_types=self.config.dataset_params.get('mag_types'),
@@ -1157,21 +1152,19 @@ class Trainer:
                                          batch_size=self.config.batch_size, 
                                          shuffle=False, num_workers=4, pin_memory=True)
             
-            # Store scaler for inference use
             self.scaler_X = scaler_X
             
             logging.info(f"Data loaded from paths: {len(train_dataset)} train, {len(val_dataset)} val, {len(test_dataset)} test samples.")
             
         elif mode_type == 'ratio':
-            # Use ratio-based splitting
+            # Split one full catalog into train, validation, and test subsets.
             ratios = self.config.dataset_mode.get('ratios', {'train': 0.8, 'val': 0.1, 'test': 0.1})
             logging.info(f"Using ratio-based dataset splitting: {ratios}")
             
-            # Read data file to get total number of samples for index splitting
-            dataset = cu.readfile(self.config.dataset_params.get('file_path'))
+            # Read the full catalog once, then split row indices.
+            dataset = readfile(self.config.dataset_params.get('file_path'))
             total_samples = len(dataset)
             
-            # Split indices first
             indices = list(range(total_samples))
             val_test_ratio = ratios['val'] + ratios['test']
             train_indices, temp_indices = train_test_split(
@@ -1184,7 +1177,7 @@ class Trainer:
                 random_state=self.config.random_seed
             )
             
-            # Create dataset without scaling to fit scaler on training data only
+            # Build an unscaled dataset to fit the scaler on training rows only.
             temp_dataset = Dataset_Photz(
                 file_path=self.config.dataset_params.get('file_path'),
                 mag_types=self.config.dataset_params.get('mag_types'),
@@ -1199,12 +1192,12 @@ class Trainer:
                 label_transform_params=self.config.label_transform_params
             )
             
-            # Extract training features and fit scaler
+            # Fit the scaler only on the training subset.
             train_features = temp_dataset.features[train_indices]
             scaler_X = StandardScaler()
             scaler_X.fit(train_features)
             
-            # Create all datasets with the fitted scaler
+            # Recreate all splits with the fitted scaler attached.
             train_dataset = Dataset_Photz(
                 file_path=self.config.dataset_params.get('file_path'),
                 mag_types=self.config.dataset_params.get('mag_types'),
@@ -1266,22 +1259,21 @@ class Trainer:
                                          num_workers=4, 
                                          pin_memory=True)
             
-            # Store scaler for inference use
             self.scaler_X = scaler_X
             
             logging.info(f"Data loaded: {len(train_subset)} train, {len(val_subset)} val, {len(test_subset)} test samples.")
         else:
             raise ValueError(f"Unsupported dataset_mode type: {mode_type}. Use 'ratio' or 'files'.")
         
-        # Save scaler immediately after data setup
+        # Save the fitted scaler immediately after dataset setup.
         self._save_scaler()
 
     def _setup_model(self):
-        # Get input dimension from the first training sample
+        # Infer the input dimension from one batch produced by the loader.
         sample_batch = next(iter(self.trainloader))
         input_dim = sample_batch['input'].shape[1]
         
-        # Create model with correct input dimension
+        # Rebuild the configured model with the inferred input size.
         model_params = self.config.model_params.copy()
         model_params['input_dim'] = input_dim
         
@@ -1337,7 +1329,7 @@ class Trainer:
 
             loss.backward()
             
-            # 梯度裁剪
+            # Clip gradients when the config requests it.
             if self.config.gradient_clipping['enabled']:
                 if self.config.gradient_clipping['method'] == 'norm':
                     torch.nn.utils.clip_grad_norm_(
@@ -1384,17 +1376,17 @@ class Trainer:
         return calculate_metrics(np.array(all_labels), np.array(all_preds), running_loss, len(loader))
 
     def _update_and_log(self, epoch, train_metrics, val_metrics, duration):
-        # Update metrics history
+        # Store metric history for plotting.
         for metric in self.train_metrics.keys():
             self.train_metrics[metric].append(train_metrics[metric])
             self.val_metrics[metric].append(val_metrics[metric])
 
-        # Log to console and file
+        # Write the latest metrics to the log.
         logging.info(f"Epoch {epoch+1}/{self.config.epochs} | Duration: {duration:.2f}m")
         logging.info(f"\tTrain Loss: {train_metrics['loss']:.4f}, MSE: {train_metrics['mse']:.4f}, MAE: {train_metrics['mae']:.4f}, R2: {train_metrics['r2']:.4f}")
         logging.info(f"\tVal   Loss: {val_metrics['loss']:.4f}, MSE: {val_metrics['mse']:.4f}, MAE: {val_metrics['mae']:.4f}, R2: {val_metrics['r2']:.4f}")
 
-        # Update learning rate scheduler
+        # Step the scheduler after each epoch.
         if self.scheduler:
             if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 self.scheduler.step(val_metrics['loss'])
@@ -1478,10 +1470,11 @@ class Trainer:
                 
                 
                 
-#============================================================
+# ============================================================
 # Inference
-#============================================================
+# ============================================================
 class PhotozInference:
+    """Load a trained run directory and generate LSTM photo-z predictions."""
     
     def __init__(self, 
                  model_dir: str, 
@@ -1519,7 +1512,7 @@ class PhotozInference:
         logging.info(f"Using device: {self.device}")
         
     def _setup_device(self, device: str) -> torch.device:
-        """设置推理设备"""
+        """Resolve the device used for inference."""
         if device == 'cpu':
             return torch.device('cpu')
         
@@ -1529,7 +1522,7 @@ class PhotozInference:
                 return torch.device('cpu')
             return torch.device('cuda')
         
-        # Check if a specific GPU is specified (e.g., cuda:0, cuda:1, etc.)
+        # Accept explicit GPU ids such as ``cuda:0`` and ``cuda:1``.
         if device.startswith('cuda:'):
             if not torch.cuda.is_available():
                 warnings.warn("CUDA not available, falling back to CPU")
@@ -1545,7 +1538,7 @@ class PhotozInference:
                 warnings.warn(f"Invalid device format: {device}, falling back to auto mode")
                 return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # auto模式
+        # Fall back to the first available CUDA device when possible.
         return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     def _load_model(self):
@@ -1577,7 +1570,7 @@ class PhotozInference:
         logging.info(f"Model loaded from {model_path}")
         
     def _set_dropout_mode(self, training: bool) -> None:
-        """设置dropout层的训练/评估模式"""
+        """Enable or disable dropout layers without changing the whole model mode."""
         def set_dropout(m):
             if isinstance(m, nn.Dropout):
                 m.train(training)
@@ -1588,7 +1581,7 @@ class PhotozInference:
         mode = 'inference'
         
         if isinstance(data_source, str):
-            # File path
+            # Build the dataset from a catalog path.
             dataset = Dataset_Photz(
                 file_path=data_source,
                 mag_types=self.config.dataset_params.get('mag_types'),
@@ -1603,7 +1596,7 @@ class PhotozInference:
                 label_transform_params=self.config.label_transform_params
             )
         else:
-            # DataFrame
+            # Build the dataset from an in-memory DataFrame.
             dataset = Dataset_Photz(
                 dataset=data_source,
                 mag_types=self.config.dataset_params.get('mag_types'),
@@ -1649,7 +1642,8 @@ class PhotozInference:
         )
         
         if mc_runs == 1:
-            self.model.eval()  # dropout disabled
+            # Run standard deterministic inference.
+            self.model.eval()
             predictions = []
             with torch.no_grad():
                 for batch in dataloader:
@@ -1657,7 +1651,7 @@ class PhotozInference:
                     outputs = self.model(inputs)
                     
                     if self.config.model_class_name in ['DeepPhotozNetWithUncertainty', 'DeepPhotozLSTMWithUncertainty']:
-                        # If the model returns mu and sigma, we only use mu for standard prediction
+                        # Use only the mean prediction for deterministic inference.
                         mu, _ = outputs
                         predictions.extend(mu.cpu().numpy())
                     else:
@@ -1675,12 +1669,12 @@ class PhotozInference:
             return predictions
         
         else:
-            # Monte Carlo Dropout mode for uncertainty estimation
+            # Repeat stochastic forward passes to estimate predictive spread.
             all_predictions = []
             
             for sample_idx in range(mc_runs):
                 self.model.eval()
-                self._set_dropout_mode(training=True) # dropout enabled
+                self._set_dropout_mode(training=True)
                 
                 sample_predictions = []
                 with torch.no_grad():
@@ -1689,7 +1683,7 @@ class PhotozInference:
                         outputs = self.model(inputs)
                         
                         if self.config.model_class_name in ['DeepPhotozNetWithUncertainty', 'DeepPhotozLSTMWithUncertainty']:
-                            # In MC dropout with uncertainty model, we're interested in mu's stability
+                            # Use the mean head when the model also predicts scale.
                             mu, _ = outputs
                             sample_predictions.extend(mu.cpu().numpy())
                         else:
@@ -1703,7 +1697,7 @@ class PhotozInference:
             predictions_std = np.std(all_predictions, axis=0)
             
             if self.config.label_transform != 'none':
-                # Transform all samples first, then calculate statistics
+                # Transform every sample first, then recompute summary statistics.
                 transformed_samples = []
                 for sample in all_predictions:
                     transformed_sample = Dataset_Photz.inverse_transform_labels(
@@ -1720,19 +1714,17 @@ class PhotozInference:
                 return {
                     'mean': predictions_mean,
                     'std': predictions_std,
-                    # 'all_samples': transformed_samples
                 }
             else:
                 return {
                     'mean': predictions_mean,
                     'std': predictions_std,
-                    # 'all_samples': all_predictions
                 }
 
 
-#============================================================
+# ============================================================
 # Main
-#============================================================
+# ============================================================
 def main():
     """Main entry point for the training script."""
     parser = argparse.ArgumentParser(description="Train a regression model based on a YAML config file.")
@@ -1740,10 +1732,9 @@ def main():
     
     args = parser.parse_args()
     
-    # Create a default config object
+    # Start from defaults and then override them from YAML.
     config = Config()
     
-    # Update from YAML file, which is the primary source of configuration
     if Path(args.config).exists():
         config.update_from_yaml(args.config)
     else:
