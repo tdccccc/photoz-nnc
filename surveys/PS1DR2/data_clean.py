@@ -1,7 +1,8 @@
 """PS1DR2 catalog cleaning recipes.
 
 This file holds the cleaning routines applied to PS1DR2 tile catalogs.
-There are two distinct recipes that target different downstream uses:
+There are three distinct recipe groups that target different downstream
+uses:
 
 * **Release cleaning** (:func:`clean_for_release`, implemented below) —
   the cleaning applied to the public catalog shipped with the paper.
@@ -15,6 +16,12 @@ There are two distinct recipes that target different downstream uses:
   appends adjacent-band color columns used as model features. Lives
   next to the release recipe so the two can be read and diffed in one
   place.
+
+* **Galaxy-classifier cleaning** (:func:`clean_for_galaxy_clf_strict`
+  and :func:`clean_for_galaxy_clf_loose`) — the cleaning used to build
+  PS1DR2 non-galaxy samples for the galaxy-clf stage. Both variants
+  share the same object-level quality filtering and differ only in the
+  final PSF/Kron morphology cut.
 """
 
 from __future__ import annotations
@@ -22,7 +29,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-__all__ = ["clean_for_release", "clean_for_training"]
+__all__ = [
+    "clean_for_training",
+    "clean_for_release",
+    "clean_for_galaxy_clf_strict",
+    "clean_for_galaxy_clf_loose",
+]
+
 
 
 def clean_for_release(df_raw: pd.DataFrame) -> pd.DataFrame:
@@ -134,6 +147,7 @@ def clean_for_release(df_raw: pd.DataFrame) -> pd.DataFrame:
     return df_clean
 
 
+
 # ---------------------------------------------------------------------------
 # Training cleaning
 # ---------------------------------------------------------------------------
@@ -240,5 +254,132 @@ def clean_for_training(df_raw: pd.DataFrame) -> pd.DataFrame:
         'Kron_gr', 'Kron_ri', 'Kron_iz', 'Kron_zy',
     ]
     print(df[cols].isna().any(axis=1).sum())
+
+    return df
+
+
+
+# ---------------------------------------------------------------------------
+# Galaxy-classifier cleaning
+# ---------------------------------------------------------------------------
+
+def clean_for_galaxy_clf_strict(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Strict PS1DR2 cleaning for the galaxy_clf non-galaxy sample.
+
+    This recipe is taken from the "strict cleaning" cell in
+    ``surveys/PS1DR2/process.ipynb`` and is intended for the
+    galaxy-classifier stage. After the shared object-level filtering,
+    it keeps only sources that are point-like in g, r, and i:
+
+    ``abs(PSFMag - KronMag) < 0.1`` in all three bands.
+
+    This function only performs the cleaning step. Dereddening,
+    column projection, and ``label`` assignment remain outside.
+    """
+    df = _clean_for_galaxy_clf_base(df_raw)
+
+    threshold = 0.1
+    mask = (
+        (np.abs(df["gPSFMag"] - df["gKronMag"]) < threshold)
+        & (np.abs(df["rPSFMag"] - df["rKronMag"]) < threshold)
+        & (np.abs(df["iPSFMag"] - df["iKronMag"]) < threshold)
+    )
+    df = df[mask].reset_index(drop=True)
+    print(f"galaxy_clf strict - PSF/Kron cut: {len(df):,}")
+
+    return df
+
+
+def clean_for_galaxy_clf_loose(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Loose PS1DR2 cleaning for the galaxy_clf non-galaxy sample.
+
+    This recipe is taken from the "loose cleaning" cell in
+    ``surveys/PS1DR2/process.ipynb`` and is intended for the
+    galaxy-classifier stage. After the shared object-level filtering,
+    it applies only the narrow r-band point-source cut:
+
+    ``abs(rPSFMag - rKronMag) < 0.01``.
+
+    This function only performs the cleaning step. Dereddening,
+    column projection, and ``label`` assignment remain outside.
+    """
+    df = _clean_for_galaxy_clf_base(df_raw)
+
+    mask = np.abs(df["rPSFMag"] - df["rKronMag"]) < 0.01
+    df = df[mask].reset_index(drop=True)
+    print(f"galaxy_clf loose - PSF/Kron cut: {len(df):,}")
+
+    return df
+
+
+def _clean_for_galaxy_clf_base(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Shared PS1DR2 cleaning for galaxy_clf non-galaxy samples.
+
+    This helper mirrors the common part of the strict / loose cleaning
+    cells in ``surveys/PS1DR2/process.ipynb``:
+
+    1. Replace PS1 sentinel values with ``NaN`` and drop incomplete rows.
+    2. Require ``nDetections >= 1``.
+    3. Reject extended sources via ``objInfoFlag``.
+    4. Reject bad-object and bad-quality flags.
+    5. Reject severe per-band ``infoFlag`` contamination.
+
+    The final morphology cut is left to the strict / loose wrappers.
+    Input magnitudes are the raw PS1 values (not yet dereddened).
+    """
+    df = df_raw.copy()
+    n_orig = len(df)
+
+    # Some FITS readers leave 1-element vectors as object-valued cells.
+    # Collapse those to scalars before applying scalar comparisons.
+    for col in df.columns:
+        sample = next((v for v in df[col] if v is not None), None)
+        if isinstance(sample, (np.ndarray, list, tuple)):
+            arr = np.asarray(sample)
+            if arr.ndim == 1 and arr.size == 1:
+                df[col] = df[col].map(
+                    lambda x: np.asarray(x).reshape(-1)[0]
+                    if isinstance(x, (np.ndarray, list, tuple))
+                    and np.asarray(x).size == 1
+                    else x
+                )
+
+    invalid_vals = [-99.0, -99, -999.0, -9999.0, -999, -9999]
+    df = df.replace(invalid_vals, np.nan)
+    df = df.dropna().reset_index(drop=True)
+    print(f"galaxy_clf base - dropna: {n_orig:,} -> {len(df):,}")
+
+    df = df[np.asarray(df["nDetections"]).flatten() >= 1].reset_index(drop=True)
+    print(f"galaxy_clf base - nDetections: {len(df):,}")
+
+    ext_flags = 0x00000001 | 0x00000002
+    bad_obj_mask = 0x00000020 | 0x00000040 | 0x00080000 | 0x00100000
+    flags = np.nan_to_num(
+        np.asarray(df["objInfoFlag"]).flatten().astype(np.int64), nan=0
+    )
+    mask = ((flags & ext_flags) == 0) & ((flags & bad_obj_mask) == 0)
+    df = df[mask].reset_index(drop=True)
+    print(f"galaxy_clf base - objInfoFlag: {len(df):,}")
+
+    bad_quality_mask = 0x00000040 | 0x00000080
+    flags = np.nan_to_num(
+        np.asarray(df["qualityFlag"]).flatten().astype(np.int64), nan=0
+    )
+    df = df[(flags & bad_quality_mask) == 0].reset_index(drop=True)
+    print(f"galaxy_clf base - qualityFlag: {len(df):,}")
+
+    suspicious_mask = (
+        0x8 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0x10000 | 0x400000 | 0x1000000
+    )
+    mask = np.ones(len(df), dtype=bool)
+    for band in ["g", "r", "i", "z", "y"]:
+        col = f"{band}infoFlag"
+        if col in df.columns:
+            flags = np.nan_to_num(
+                np.asarray(df[col]).flatten().astype(np.int64), nan=0
+            )
+            mask &= (flags & suspicious_mask) == 0
+    df = df[mask].reset_index(drop=True)
+    print(f"galaxy_clf base - infoFlag: {len(df):,}")
 
     return df
