@@ -17,6 +17,7 @@ dist/
 
 # Editor / IDE
 .vscode/
+.codex
 .idea/
 
 # pytest / cache
