@@ -4,14 +4,15 @@ Photometric redshift PDFs via neural network classification for DESI Legacy Imag
 
 This repository accompanies the manuscript:
 
-**Photometric Redshift PDFs via Neural Network Classification for DESI Legacy Imaging Surveys and Pan-STARRS**
+**Photometric Redshift PDFs via Neural Network Classification for DESI Legacy Imaging Surveys and Pan-STARRS** — [arXiv:2602.01548](https://arxiv.org/abs/2602.01548)
 
 ## Status
 
-This repository has been created in advance of the full public code release.
+This repository hosts the data preparation, model training, and catalog
+production code used in the paper. Additional examples and user-facing
+documentation are still being added.
 
-The codebase is currently being cleaned up, reorganized, and documented.  
-A complete and user-friendly release will be uploaded after the final preparation is finished.
+See [`pipelines/README.md`](pipelines/README.md) for end-to-end workflows.
 
 ## Project Overview
 
@@ -32,15 +33,36 @@ The catalog associated with this work is available at Zenodo:
 
 For practical use and download efficiency, the public data release provides **40-bin redshift PDFs** obtained by rebinning the native **400-bin model output**.
 
-## Planned Repository Contents
+## Installation
 
-The full release is expected to include:
+```bash
+git clone https://github.com/tdccccc/photoz-nnc.git
+cd photoz-nnc
+pip install -e .
+```
 
-- model training and inference scripts,
-- data preprocessing utilities,
-- calibration and evaluation scripts,
-- figure-generation notebooks/scripts,
-- example workflows for reproducing the main results in the paper.
+`pip install -e .` builds the C++ extension under `lib/cpp_src` via
+pybind11 and exposes `lib`, `surveys`, and `models` as importable
+packages.
+
+## Usage
+
+End-to-end training and release workflows are documented in
+[`pipelines/README.md`](pipelines/README.md). Common entry points:
+
+- Train NNC: `python -m models.photoz.NNC.train --config <config.yaml>`
+- Predict with NNC: `python -m models.photoz.NNC.predict --input ... --model-dir ... --output ...`
+- Build the released catalog: `python -m catalog --stage <lsdr10|ps1dr2|merge|publish|check>`
+
+## Repository Layout
+
+- `lib/` — shared utilities (I/O, cross-match, metrics, PIT, recollect, ...)
+- `surveys/` — per-survey download and cleaning helpers (LSDR10, PS1DR2, unWISE, SDSSDR19, DESIDR1)
+- `models/` — per-algorithm training and prediction code (NNC, ANN, XGBoost, RandomForest, KNN, LSTM, Ensemble; plus galaxy classifier)
+- `catalog/` — released-catalog prediction, merge, and publish pipeline
+- `pipelines/` — workflow documentation
+- `figures/` — figure-generation notebooks
+- `legacy/` — original source files and development notes from earlier stages of the project; kept for reference only (paths inside are author-local and not reproducible as-is)
 
 ## Citation
 

@@ -1,5 +1,11 @@
 # photoz-nnc 所有相关文件和处理流程
 
+> **Note:** This file is a snapshot of the original development notes.
+> All paths are author-local (`/home/tiandc/...`) and are not reproducible
+> as-is. Kept for reference only — current workflows live in
+> `pipelines/README.md` and the top-level packages (`lib/`, `surveys/`,
+> `models/`, `catalog/`).
+
 # 一些工具函数
 `cosmic`库：
 - 工具函数文件：`/home/tiandc/myutils/cosmic/utils.py`
